@@ -25,7 +25,7 @@
 //|  Works on: EUR/USD M5 or M15                                       |
 //+------------------------------------------------------------------+
 #property copyright   "ICT EA – MARK1"
-#property version     "2.00"
+#property version     "3.00"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -77,7 +77,7 @@ input int    InpNewsResumeAfter  = 15;     // Minutes to resume after high-impac
 
 // ── H4 Market Structure Filter ───────────────────────────────────────
 input group "=== H4 Market Structure Confirmation ==="
-input bool   InpEnableH4Filter   = true;   // Require H4 BOS alignment before entry
+input bool   InpEnableH4Filter   = false;   // Require H4 BOS alignment before entry
 input int    InpH4LookbackBars   = 50;     // H4 bars to scan for BOS [FIX-04 uses i=3 start]
 
 // [FIX-10] Premium / Discount Zone — D1 equilibrium filter
