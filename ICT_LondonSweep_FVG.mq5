@@ -63,20 +63,21 @@ input int    InpOrderExpiryBars        = 10;    // Expire pending order after N 
 input int    InpMagicNumber            = 202601;
 
 input group "=== Strong Displacement Filter ==="
-input int    InpMinDisplacementBodyPct = 70;    // Min body as % of bar range
-input int    InpMinDisplacementPips    = 8;     // Min body size in pips
+input int    InpMinDisplacementBodyPct = 60;    // Min body as % of bar range  [Phase 2: raise to 70]
+input int    InpMinDisplacementPips    = 6;     // Min body size in pips  [Phase 2: raise to 8]
 
-input group "=== FVG Size Filter ==="
-input int    InpMinFVGPips             = 5;     // Minimum FVG gap in pips
+input group "=== FVG Settings ==="
+input int    InpFVGScanBars            = 5;     // Rolling window bars to search for FVG after sweep
+input int    InpMinFVGPips             = 3;     // Minimum FVG gap in pips  [Phase 2: raise to 5]
 
 input group "=== D1 Trend Filter ==="
-input bool   InpEnableTrendFilter      = true;  // Gate entries to D1 200 EMA direction
+input bool   InpEnableTrendFilter      = false; // Gate entries to D1 200 EMA direction  [Phase 2: enable]
 
 input group "=== Daily Loss Circuit Breaker ==="
 input double InpDailyLossLimitPct      = 1.5;   // Daily equity drawdown % to halt
 
 input group "=== Consecutive Loss Pause ==="
-input int    InpMaxConsecLosses        = 3;     // Pause next day after N straight losses
+input int    InpMaxConsecLosses        = 4;     // Pause next day after N straight losses
 
 input group "=== Debug ==="
 input bool   InpDebugLog               = true;  // Enable verbose logging
@@ -325,81 +326,95 @@ void DetectJudasSwing()
 //+------------------------------------------------------------------+
 //| ScanForFVGAndEnter                                                 |
 //+------------------------------------------------------------------+
-// 3-candle pattern (bar1=newest, bar2=middle displacement, bar3=oldest):
-//   Bullish FVG: high3 < low1  (upside gap — buy retracement)
-//   Bearish FVG: low3 > high1  (downside gap — sell retracement)
+// 3-candle pattern scanned across a rolling InpFVGScanBars window:
+//   Bullish FVG: high[offset+2] < low[offset]  (upside gap — buy retracement)
+//   Bearish FVG: low[offset+2]  > high[offset] (downside gap — sell retracement)
+// Displacement check is always applied to bar[offset+1] (the impulse candle).
 void ScanForFVGAndEnter(bool isSilverBullet = false)
 {
-   if(Bars(Symbol(), Period()) < 5)
+   int minBars = InpFVGScanBars + 2;
+   if(Bars(Symbol(), Period()) < minBars)
       return;
-
-   double high1 = iHigh(Symbol(), Period(), 1);  // Newest closed bar
-   double low1  = iLow(Symbol(),  Period(), 1);
-   double high3 = iHigh(Symbol(), Period(), 3);  // Oldest of 3-bar pattern
-   double low3  = iLow(Symbol(),  Period(), 3);
 
    bool fvgFound = false;
 
-   if(g_sweepBullish)
+   for(int offset = 1; offset <= InpFVGScanBars - 2 && !fvgFound; offset++)
    {
-            if(high3 < low1)
-      {
-         g_fvgHigh = low1;
-         g_fvgLow  = high3;
+      double high_n  = iHigh(Symbol(), Period(), offset);      // newest bar of 3-bar pattern
+      double low_n   = iLow(Symbol(),  Period(), offset);
+      double high_n2 = iHigh(Symbol(), Period(), offset + 2);  // oldest bar of 3-bar pattern
+      double low_n2  = iLow(Symbol(),  Period(), offset + 2);
 
-         if(!IsStrongDisplacement(2, true))
-         {
-            Log("BULLISH FVG REJECTED: bar2 fails displacement filter.");
-            g_setupConsumed = true; return;
-         }
-         double fvgRangeBull = g_fvgHigh - g_fvgLow;
-         if(fvgRangeBull < InpMinFVGPips * g_pipSize)
-         {
-            Log("BULLISH FVG REJECTED: size=" +
-                DoubleToString(fvgRangeBull / g_pipSize, 1) + " pips < min=" +
-                IntegerToString(InpMinFVGPips));
-            g_setupConsumed = true; return;
-         }         g_fvgMid    = g_fvgLow + fvgRangeBull * 0.25;
-         g_fvgFormed = true;
-         fvgFound    = true;
-         Log("BULLISH FVG ACCEPTED | Zone: " + DoubleToString(g_fvgLow, _Digits) +
-             "-" + DoubleToString(g_fvgHigh, _Digits) +
-             " | Entry25%=" + DoubleToString(g_fvgMid, _Digits) +
-             " | Size=" + DoubleToString(fvgRangeBull / g_pipSize, 1) + "p");
-      }
-   }
-   else
-   {
-            if(low3 > high1)
+      if(g_sweepBullish)
       {
-         g_fvgHigh = low3;
-         g_fvgLow  = high1;
+         // Bullish FVG: gap between old bar's high and new bar's low
+         if(high_n2 < low_n)
+         {
+            g_fvgHigh = low_n;
+            g_fvgLow  = high_n2;
 
-         if(!IsStrongDisplacement(2, false))
-         {
-            Log("BEARISH FVG REJECTED: bar2 fails displacement filter.");
-            g_setupConsumed = true; return;
+            if(!IsStrongDisplacement(offset + 1, true))
+            {
+               Log("BULLISH FVG [off=" + IntegerToString(offset) + "]: displacement FAIL — scanning next.");
+               continue;
+            }
+            double fvgRange = g_fvgHigh - g_fvgLow;
+            if(fvgRange < InpMinFVGPips * g_pipSize)
+            {
+               Log("BULLISH FVG [off=" + IntegerToString(offset) + "]: size=" +
+                   DoubleToString(fvgRange / g_pipSize, 1) + "p < min=" +
+                   IntegerToString(InpMinFVGPips) + "p — scanning next.");
+               continue;
+            }
+            g_fvgMid    = g_fvgLow + fvgRange * 0.25;
+            g_fvgFormed = true;
+            fvgFound    = true;
+            Log("BULLISH FVG ACCEPTED [off=" + IntegerToString(offset) + "] | Zone: " +
+                DoubleToString(g_fvgLow, _Digits) + "-" + DoubleToString(g_fvgHigh, _Digits) +
+                " | Entry25%=" + DoubleToString(g_fvgMid, _Digits) +
+                " | Size=" + DoubleToString(fvgRange / g_pipSize, 1) + "p");
          }
-         double fvgRangeBear = g_fvgHigh - g_fvgLow;
-         if(fvgRangeBear < InpMinFVGPips * g_pipSize)
-         {
-            Log("BEARISH FVG REJECTED: size=" +
-                DoubleToString(fvgRangeBear / g_pipSize, 1) + " pips < min=" +
-                IntegerToString(InpMinFVGPips));
-            g_setupConsumed = true; return;
-         }
-         g_fvgMid    = g_fvgHigh - fvgRangeBear * 0.25;
-         g_fvgFormed = true;
-         fvgFound    = true;
-         Log("BEARISH FVG ACCEPTED | Zone: " + DoubleToString(g_fvgLow, _Digits) +
-             "-" + DoubleToString(g_fvgHigh, _Digits) +
-             " | Entry25%=" + DoubleToString(g_fvgMid, _Digits) +
-             " | Size=" + DoubleToString(fvgRangeBear / g_pipSize, 1) + "p");
       }
-   }
+      else
+      {
+         // Bearish FVG: gap between old bar's low and new bar's high
+         if(low_n2 > high_n)
+         {
+            g_fvgHigh = low_n2;
+            g_fvgLow  = high_n;
+
+            if(!IsStrongDisplacement(offset + 1, false))
+            {
+               Log("BEARISH FVG [off=" + IntegerToString(offset) + "]: displacement FAIL — scanning next.");
+               continue;
+            }
+            double fvgRange = g_fvgHigh - g_fvgLow;
+            if(fvgRange < InpMinFVGPips * g_pipSize)
+            {
+               Log("BEARISH FVG [off=" + IntegerToString(offset) + "]: size=" +
+                   DoubleToString(fvgRange / g_pipSize, 1) + "p < min=" +
+                   IntegerToString(InpMinFVGPips) + "p — scanning next.");
+               continue;
+            }
+            g_fvgMid    = g_fvgHigh - fvgRange * 0.25;
+            g_fvgFormed = true;
+            fvgFound    = true;
+            Log("BEARISH FVG ACCEPTED [off=" + IntegerToString(offset) + "] | Zone: " +
+                DoubleToString(g_fvgLow, _Digits) + "-" + DoubleToString(g_fvgHigh, _Digits) +
+                " | Entry25%=" + DoubleToString(g_fvgMid, _Digits) +
+                " | Size=" + DoubleToString(fvgRange / g_pipSize, 1) + "p");
+         }
+      }
+   } // end rolling window loop
 
    if(fvgFound)
       PlaceLimitOrder(isSilverBullet);
+   else
+   {
+      Log("FVG SCAN: no valid FVG in " + IntegerToString(InpFVGScanBars - 2) +
+          "-bar window after sweep. Setup consumed.");
+      g_setupConsumed = true;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -850,6 +865,10 @@ void ResetDailyState(datetime currentGMT)
    g_obHigh         = 0.0;
    g_obLow          = 0.0;
    g_obTime         = 0;
+
+   // FIX-F: Reset daily circuit breaker so trading resumes each new day
+   g_dailyLimitHit      = false;
+   g_dailyStartBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
 }
 
 //+------------------------------------------------------------------+
