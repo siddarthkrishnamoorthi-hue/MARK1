@@ -148,6 +148,12 @@ int OnInit()
               ? SymbolInfoDouble(Symbol(), SYMBOL_POINT) * 10.0
               : SymbolInfoDouble(Symbol(), SYMBOL_POINT);
 
+   if(InpFVGScanBars < 3)
+   {
+      Print("[ICT-EA] INIT ERROR: InpFVGScanBars must be >= 3. Got: ", InpFVGScanBars);
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
    g_gmtOffset     = CalculateGMTOffset();
    g_asianRangeDate = GetGMTTime() - 86400;
    g_lastBarTime   = (datetime)SeriesInfoInteger(Symbol(), Period(), SERIES_LASTBAR_DATE);
@@ -168,7 +174,7 @@ int OnInit()
    g_lastResetDay      = TimeCurrent();
    g_dailyLimitHit     = false;
 
-   Log("EA Init v3.00 | Pip=" + DoubleToString(g_pipSize, _Digits) +
+   Log("EA Init v3.10 | Pip=" + DoubleToString(g_pipSize, _Digits) +
        " Risk=" + DoubleToString(InpRiskPercent, 1) + "%" +
        " TrendFilter=" + (InpEnableTrendFilter ? "ON" : "OFF") +
        " DailyLimit=" + DoubleToString(InpDailyLossLimitPct, 1) + "%");
@@ -203,16 +209,17 @@ void OnTick()
    MqlDateTime gmtDt;
    TimeToStruct(gmtTime, gmtDt);
 
-   // Daily balance snapshot reset
+   // Daily balance snapshot reset — use GMT so this fires at the same
+   // midnight boundary as ResetDailyState(), not at server-local midnight.
    {
       MqlDateTime nowDt, prevDt;
-      TimeToStruct(TimeCurrent(), nowDt);
+      TimeToStruct(GetGMTTime(), nowDt);
       TimeToStruct(g_lastResetDay, prevDt);
       if(nowDt.year != prevDt.year || nowDt.mon != prevDt.mon || nowDt.day != prevDt.day)
       {
          g_dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
          g_dailyLimitHit     = false;
-         g_lastResetDay      = TimeCurrent();
+         g_lastResetDay      = GetGMTTime();
          Log("Daily CB reset. StartBalance=" + DoubleToString(g_dailyStartBalance, 2));
       }
    }
@@ -354,18 +361,10 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
             g_fvgLow  = high_n2;
 
             if(!IsStrongDisplacement(offset + 1, true))
-            {
-               Log("BULLISH FVG [off=" + IntegerToString(offset) + "]: displacement FAIL — scanning next.");
                continue;
-            }
             double fvgRange = g_fvgHigh - g_fvgLow;
             if(fvgRange < InpMinFVGPips * g_pipSize)
-            {
-               Log("BULLISH FVG [off=" + IntegerToString(offset) + "]: size=" +
-                   DoubleToString(fvgRange / g_pipSize, 1) + "p < min=" +
-                   IntegerToString(InpMinFVGPips) + "p — scanning next.");
                continue;
-            }
             g_fvgMid    = g_fvgLow + fvgRange * 0.25;
             g_fvgFormed = true;
             fvgFound    = true;
@@ -384,18 +383,10 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
             g_fvgLow  = high_n;
 
             if(!IsStrongDisplacement(offset + 1, false))
-            {
-               Log("BEARISH FVG [off=" + IntegerToString(offset) + "]: displacement FAIL — scanning next.");
                continue;
-            }
             double fvgRange = g_fvgHigh - g_fvgLow;
             if(fvgRange < InpMinFVGPips * g_pipSize)
-            {
-               Log("BEARISH FVG [off=" + IntegerToString(offset) + "]: size=" +
-                   DoubleToString(fvgRange / g_pipSize, 1) + "p < min=" +
-                   IntegerToString(InpMinFVGPips) + "p — scanning next.");
                continue;
-            }
             g_fvgMid    = g_fvgHigh - fvgRange * 0.25;
             g_fvgFormed = true;
             fvgFound    = true;
@@ -411,9 +402,20 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
       PlaceLimitOrder(isSilverBullet);
    else
    {
-      Log("FVG SCAN: no valid FVG in " + IntegerToString(InpFVGScanBars - 2) +
-          "-bar window after sweep. Setup consumed.");
-      g_setupConsumed = true;
+      // Only permanently consume the setup once we are past the Judas window.
+      // If still inside the kill zone, leave g_setupConsumed=false so the next
+      // bar re-runs the scan — the FVG may not have formed yet.
+      MqlDateTime gmtDtScan;
+      TimeToStruct(GetGMTTime(), gmtDtScan);
+      if(gmtDtScan.hour >= InpJudasEndHour + 1)
+      {
+         Log("FVG SCAN: no valid FVG in " + IntegerToString(InpFVGScanBars - 2) +
+             "-bar window after sweep. Past Judas window — setup consumed.");
+         g_setupConsumed = true;
+      }
+      else
+         Log("FVG SCAN: no valid FVG yet in " + IntegerToString(InpFVGScanBars - 2) +
+             "-bar window — will retry next bar.");
    }
 }
 
@@ -869,6 +871,9 @@ void ResetDailyState(datetime currentGMT)
    // FIX-F: Reset daily circuit breaker so trading resumes each new day
    g_dailyLimitHit      = false;
    g_dailyStartBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   // g_pauseUntilDay is intentionally NOT reset here — it self-expires once
+   // TimeCurrent() passes its value (checked in OnTick). This prevents the
+   // consecutive-loss pause from being cleared by a regular day rollover.
 }
 
 //+------------------------------------------------------------------+
@@ -1000,6 +1005,10 @@ void UpdateWeeklyBiasIfMonday(const MqlDateTime &dt)
 // AND >= InpMinDisplacementPips pips in size.
 bool IsStrongDisplacement(int barIndex, bool isBullish)
 {
+   // Both thresholds at zero acts as a full disable of the displacement filter.
+   if(InpMinDisplacementBodyPct == 0 && InpMinDisplacementPips == 0)
+      return true;
+
    double open  = iOpen(Symbol(),  Period(), barIndex);
    double close = iClose(Symbol(), Period(), barIndex);
    double high  = iHigh(Symbol(),  Period(), barIndex);
@@ -1133,6 +1142,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
 
    ulong dealTicket = trans.deal;
+   HistorySelect(TimeCurrent() - 86400, TimeCurrent() + 60);
    if(!HistoryDealSelect(dealTicket)) return;
 
    if((long)HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != InpMagicNumber) return;
