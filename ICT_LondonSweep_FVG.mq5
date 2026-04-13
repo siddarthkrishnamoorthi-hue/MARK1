@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|  ICT_LondonSweep_FVG.mq5                                         |
-//|  London Open Asian Sweep + Fair Value Gap EA  v3.0               |
+//|  London Open Asian Sweep + Fair Value Gap EA  v3.1               |
 //|  ICT Concepts: Judas Swing, FVG, D1 Trend, Capital Preservation  |
 //|  Works on: EUR/USD M5 or M15                                      |
 //+------------------------------------------------------------------+
 #property copyright   "ICT EA – MARK1"
-#property version     "3.00"
+#property version     "3.10"
 #property strict
 
 enum ENUM_OB_STATE
@@ -21,7 +21,7 @@ enum ENUM_OB_STATE
 #include <Trade\OrderInfo.mqh>
 
 input group "=== Risk Management ==="
-input double InpRiskPercent            = 0.1;   // Risk per trade (% of balance)
+input double InpRiskPercent            = 0.5;   // Risk per trade (% of balance)
 input double InpRRRatio                = 3.0;   // Take Profit RR ratio
 input double InpSLPips                 = 30.0;  // Stop Loss in pips beyond sweep
 input int    InpMaxOpenTrades          = 2;     // Maximum simultaneous open positions
@@ -468,9 +468,9 @@ void PlaceLimitOrder(bool isSilverBullet = false)
          Log("OB OK | " + DoubleToString(g_obLow,_Digits) + "-" + DoubleToString(g_obHigh,_Digits));
       }
    }
-   if(!IsTrendAligned(g_sweepBullish))
+   if(InpEnableTrendFilter && !IsTrendAligned(g_sweepBullish))
    {
-      Log("TREND FILTER: Setup rejected — price trade against D1 EMA200 direction.");
+      Log("TREND FILTER: Setup rejected — price against D1 EMA200 direction.");
       g_setupConsumed = true; return;
    }
    double slPips = isSilverBullet ? InpSilverBulletSLPips : InpSLPips;
