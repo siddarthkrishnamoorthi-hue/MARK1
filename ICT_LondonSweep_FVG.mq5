@@ -365,7 +365,7 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
             double fvgRange = g_fvgHigh - g_fvgLow;
             if(fvgRange < InpMinFVGPips * g_pipSize)
                continue;
-            g_fvgMid    = g_fvgLow + fvgRange * 0.25;
+            g_fvgMid    = g_fvgHigh - fvgRange * 0.25;
             g_fvgFormed = true;
             fvgFound    = true;
             Log("BULLISH FVG ACCEPTED [off=" + IntegerToString(offset) + "] | Zone: " +
@@ -387,7 +387,7 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
             double fvgRange = g_fvgHigh - g_fvgLow;
             if(fvgRange < InpMinFVGPips * g_pipSize)
                continue;
-            g_fvgMid    = g_fvgHigh - fvgRange * 0.25;
+            g_fvgMid    = g_fvgLow + fvgRange * 0.25;
             g_fvgFormed = true;
             fvgFound    = true;
             Log("BEARISH FVG ACCEPTED [off=" + IntegerToString(offset) + "] | Zone: " +
