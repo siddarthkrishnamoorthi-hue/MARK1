@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|  ICT_LondonSweep_FVG.mq5                                         |
-//|  MARK1 v4.0 — Institutional-Grade ICT Methodology                |
+//|  MARK1 v4.1 — Institutional-Grade ICT Methodology                |
 //|  Strategy: Asian Range → Judas Swing → FVG → OTE Limit Entry     |
 //|  Target: FTMO Standard Challenge | Platform: EURUSD M15          |
 //|                                                                    |
@@ -8,11 +8,15 @@
 //|    G1 Session → G2 Asian Range → G3 Sweep Confirm → G4 Displace  |
 //|    → G5 FVG → G6 OTE Limit Order → G7 H4 Bias (lot scale)       |
 //|                                                                    |
-//|  PropFirm kill switches evaluate on EVERY tick (floating equity). |
-//|  ATR H4 regime filter makes EA adaptive across market regimes.    |
+//|  v4.1 fixes (tagged [MARK1-FIX-XX]):                             |
+//|  FIX-17: BUG-2 — filter rejections no longer set g_setupConsumed |
+//|  FIX-18: BUG-3 — NY session sweeps off London range, not Asian   |
+//|  FIX-19: BUG-4 — Silver Bullet fully independent (own sweep/FVG) |
+//|  FIX-20: BUG-5 — SL = structure-based (asianLow±0.2×range)      |
+//|  FIX-21: Gate stat counters + daily summary log                   |
 //+------------------------------------------------------------------+
-#property copyright   "ICT EA – MARK1 v4.0"
-#property version     "4.00"
+#property copyright   "ICT EA – MARK1 v4.1"
+#property version     "4.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -23,15 +27,13 @@
 //| ENUMERATIONS                                                       |
 //+------------------------------------------------------------------+
 
-// State machine drives the entire bar-by-bar logic flow.
-// Prevents duplicate scans and ensures each gate is checked in order.
 enum ENUM_EA_STATE
 {
-   STATE_IDLE,            // Waiting for Asian session / daily reset
-   STATE_AWAITING_SWEEP,  // Asian range locked; scanning for Judas sweep
-   STATE_AWAITING_FVG,    // Sweep confirmed; scanning for FVG & OTE
-   STATE_PENDING_ENTRY,   // Limit order placed; managing expiry
-   STATE_IN_TRADE         // Position open; managed in ManageOpenPositions()
+   STATE_IDLE,           // Waiting for Asian session / daily reset
+   STATE_AWAITING_SWEEP, // Asian range locked; scanning for Judas sweep
+   STATE_AWAITING_FVG,   // Sweep confirmed; scanning for FVG & OTE
+   STATE_PENDING_ENTRY,  // Limit order placed; managing expiry
+   STATE_IN_TRADE        // Position open; managed in ManageOpenPositions()
 };
 
 enum ENUM_OB_STATE
@@ -43,142 +45,175 @@ enum ENUM_OB_STATE
 };
 
 //+------------------------------------------------------------------+
-//| NAMED CONSTANTS (no magic numbers in logic)                       |
+//| NAMED CONSTANTS                                                    |
 //+------------------------------------------------------------------+
-static const int    MIN_SL_PIPS         = 15;    // Dynamic SL floor (pips)
-static const int    MAX_SL_PIPS         = 50;    // Dynamic SL ceiling (pips)
-static const double SL_RANGE_MULTIPLE   = 1.1;   // SL = AsianRange × this
-static const int    LONDON_START_GMT    = 7;     // London Kill Zone open
-static const int    LONDON_END_GMT      = 10;    // London Kill Zone close
-static const int    SILVER_BULLET_START = 10;    // Silver Bullet window open
-static const int    SILVER_BULLET_END   = 11;    // Silver Bullet window close
-static const int    NY_START_GMT        = 13;    // NY Kill Zone open
-static const int    NY_END_GMT          = 16;    // NY Kill Zone close
-static const int    FRIDAY_CUTOFF_GMT   = 20;    // No new trades after this on Fri
-static const int    CONSEC_LOSSES_HALF  = 2;     // Streak before halving risk
-static const int    CONSEC_LOSSES_STOP  = 4;     // Daily losses before halting day
-static const int    ATR_M15_PERIOD      = 14;    // ATR period for trailing stop
-static const int    ATR_H4_PERIOD       = 14;    // ATR period for regime detection
+static const double SL_STRUCTURE_BUFFER = 0.2;  // [FIX-20] SL = asianLow - 0.2*range
+static const int    MIN_SL_PIPS         = 12;   // [FIX-20] Clamp floor
+static const int    MAX_SL_PIPS         = 45;   // [FIX-20] Clamp ceiling
+static const int    LONDON_START_GMT    = 7;
+static const int    LONDON_END_GMT      = 10;
+static const int    LONDON_RANGE_END    = 12;   // [FIX-18] London range captured 07-12
+static const int    SILVER_BULLET_START = 10;   // [FIX-19] Silver Bullet: 10-11 GMT
+static const int    SILVER_BULLET_END   = 11;
+static const int    NY_START_GMT        = 13;
+static const int    NY_END_GMT          = 16;
+static const int    NY_MORNING_END      = 15;   // [FIX-19] NY morning range: 13-15 GMT
+static const int    FRIDAY_CUTOFF_GMT   = 20;
+static const int    CONSEC_LOSSES_HALF  = 2;
+static const int    CONSEC_LOSSES_STOP  = 4;
+static const int    ATR_M15_PERIOD      = 14;
+static const int    ATR_H4_PERIOD       = 14;
 
 //+------------------------------------------------------------------+
 //| INPUT PARAMETERS                                                   |
 //+------------------------------------------------------------------+
 
 input group "=== Risk Management ==="
-input double InpRiskPercent            = 0.5;    // Base risk per trade (% of equity)
-input double InpMaxDailyLossPct        = 4.0;    // Max daily loss % — halt today (FTMO: 5%)
-input double InpMaxTotalDDPct          = 8.0;    // Max total DD % — halt EA (FTMO: 10%)
-input double InpWeeklyDDSoftCapPct     = 3.5;    // Weekly DD soft cap → 50% lot size
+input double InpRiskPercent            = 0.5;   // Base risk per trade (% of equity)
+input double InpMaxDailyLossPct        = 4.0;   // Max daily loss % — halt today (FTMO: 5%)
+input double InpMaxTotalDDPct          = 8.0;   // Max total DD % — halt EA (FTMO: 10%)
+input double InpWeeklyDDSoftCapPct     = 3.5;   // Weekly DD soft cap → 50% lot size
 
 input group "=== Asian Session ==="
-input int    InpAsianStartGMT          = 0;      // Asian session start (GMT hour)
-input int    InpAsianEndGMT            = 7;      // Asian session end / range lock (GMT hour)
-input int    InpMinAsianRangePips      = 8;      // Min Asian range — skip if compressed
-input int    InpMaxAsianRangePips      = 40;     // Max Asian range — skip if explosive
-input int    InpSweepConfirmPips       = 2;      // Min wick outside Asian level (pips)
+input int    InpAsianStartGMT          = 0;     // Asian session start (GMT hour)
+input int    InpAsianEndGMT            = 7;     // Asian session end / range lock (GMT hour)
+input double InpMinAsianRangePips      = 8.0;   // Min Asian range — skip if compressed
+input double InpMaxAsianRangePips      = 50.0;  // Max Asian range — skip if explosive
+input int    InpSweepConfirmPips       = 2;     // Min wick outside Asian level (pips)
 
 input group "=== Entry Settings ==="
-input int    InpFVGScanBars            = 5;      // Bars to scan for FVG after sweep
-input int    InpMinFVGPips             = 3;      // Minimum FVG size (pips)
-input int    InpOTEPercent             = 50;     // OTE entry depth into FVG (%)
-input int    InpOrderExpiryBars        = 3;      // Cancel pending order after N bars
-input int    InpMinDisplacementBodyPct = 60;     // Min displacement body as % of range
-input int    InpMinDisplacementPips    = 6;      // Min displacement body size (pips)
+input int    InpFVGScanBars            = 5;     // Bars to scan for FVG after sweep
+input double InpMinFVGPips             = 3.0;   // Minimum FVG size (pips)
+input int    InpOTEPercent             = 50;    // OTE entry depth into FVG (%)
+input int    InpOrderExpiryBars        = 3;     // Cancel pending order after N bars
+input int    InpMinDisplacementBodyPct = 60;    // Min displacement body as % of range
+input int    InpMinDisplacementPips    = 6;     // Min displacement body size (pips)
 
 input group "=== Exit Settings ==="
-input double InpTP1Ratio               = 1.0;    // TP1 R-multiple (50% partial close)
-input double InpTP2Ratio               = 2.0;    // TP2 R-multiple (remaining 50%)
-input int    InpMaxTradeDurationHours  = 8;      // Force-close after N hours (no overnight)
+input double InpTP1RR                  = 1.0;   // TP1 R-multiple (60% partial close)
+input double InpTP2RR                  = 2.0;   // TP2 R-multiple (remaining 40%)
+input int    InpMaxTradeDurationHours  = 8;     // Force-close after N hours (no overnight)
+
+input group "=== Silver Bullet ==="
+input double InpSilverBulletSLPips     = 12.0;  // SL for Silver Bullet entries (pips)
 
 input group "=== Regime Filters ==="
-input bool   InpEnableH4Filter         = true;   // H4 BOS — reduce lots (not skip) if failing
-input double InpMinATRH4               = 30.0;   // H4 ATR(14) min pips — skip day below
-input double InpMaxATRH4               = 120.0;  // H4 ATR(14) max pips — reduce risk above
-input int    InpNewsHaltMinutes        = 30;     // Halt ±N minutes around high-impact news
-input bool   InpEnableTrendFilter      = false;  // Enable D1 EMA200 trend gate
+input bool   InpEnableH4Filter         = true;  // H4 BOS — reduce lots if failing
+input double InpMinATRH4               = 30.0;  // H4 ATR(14) min pips — skip day below
+input double InpMaxATRH4               = 120.0; // H4 ATR(14) max pips — reduce risk above
+input int    InpNewsHaltMinutes        = 30;    // Halt ±N minutes around high-impact news
+input bool   InpEnableTrendFilter      = false; // Enable D1 EMA200 trend gate
 
 input group "=== Advanced Filters ==="
-input bool   InpEnableWeeklyBias       = false;  // Filter by W1 directional bias
-input bool   InpEnablePDFilter         = false;  // Enforce D1 discount/premium zone
-input bool   InpEnableOBFilter         = false;  // Require Order Block proximity
-input double InpOBProximityPips        = 10.0;   // Max distance from OB zone (pips)
-input int    InpOBMaxAgeHours          = 24;     // Discard OBs older than N hours
-input int    InpH4LookbackBars         = 50;     // H4 bars to scan for BOS
+input bool   InpEnableWeeklyBias       = false; // Filter by W1 directional bias
+input bool   InpEnablePDFilter         = false; // Enforce D1 discount/premium zone
+input bool   InpEnableOBFilter         = false; // Require Order Block proximity
+input double InpOBProximityPips        = 10.0;  // Max distance from OB zone (pips)
+input int    InpOBMaxAgeHours          = 24;    // Discard OBs older than N hours
+input int    InpH4LookbackBars         = 50;    // H4 bars to scan for BOS
 
 input group "=== Order Settings ==="
 input int    InpMagicNumber            = 202601;
 input int    InpSlippagePoints         = 20;
 
 input group "=== Debug ==="
-input bool   InpEnableDebug            = true;   // Enable verbose debug logging
+input bool   InpEnableDebug            = true;  // Enable verbose debug logging
 
 //+------------------------------------------------------------------+
 //| GLOBAL VARIABLES                                                   |
 //+------------------------------------------------------------------+
 
-// Trade library objects
-CTrade         g_trade;
-CPositionInfo  g_pos;
-COrderInfo     g_ord;
+CTrade        g_trade;
+CPositionInfo g_pos;
+COrderInfo    g_ord;
 
-// State machine
-ENUM_EA_STATE  g_state             = STATE_IDLE;
+// State machine (London + NY shared)
+ENUM_EA_STATE g_state             = STATE_IDLE;
 
-// Asian range data
-double         g_asianHigh         = 0.0;
-double         g_asianLow          = 0.0;
-bool           g_asianLocked       = false;
+// Asian range
+double        g_asianHigh         = 0.0;
+double        g_asianLow          = 0.0;
+bool          g_asianLocked       = false;
 
-// Sweep data (set by Gate3)
-bool           g_sweepBullish      = false;
-double         g_sweepExtreme      = 0.0;    // Actual wick extreme price
-datetime       g_sweepTime         = 0;
+// [FIX-18] London range (07-12 GMT) — used as reference for NY sweeps
+double        g_londonHigh        = 0.0;
+double        g_londonLow         = 0.0;
+bool          g_londonRangeSet    = false;
 
-// FVG data (set by Gate5)
-double         g_fvgHigh           = 0.0;
-double         g_fvgLow            = 0.0;
+// [FIX-19] NY morning range (13-15 GMT) — used as reference for Silver Bullet sweeps
+double        g_nyMorningHigh     = 0.0;
+double        g_nyMorningLow      = 0.0;
+bool          g_nyMorningRangeSet = false;
 
-// Setup / daily trade guards
-bool           g_setupConsumed     = false;  // One attempt per sweep
-bool           g_tradedBuyToday    = false;  // Max 1 buy trade per day
-bool           g_tradedSellToday   = false;  // Max 1 sell trade per day
+// London / NY sweep data
+bool          g_sweepBullish      = false;
+double        g_sweepExtreme      = 0.0;
+datetime      g_sweepTime         = 0;
+
+// [FIX-19] Silver Bullet independent sweep state
+bool          g_sbSweepDetected   = false;
+bool          g_sbSweepBullish    = false;
+double        g_sbSweepExtreme    = 0.0;
+
+// FVG data
+double        g_fvgHigh           = 0.0;
+double        g_fvgLow            = 0.0;
+
+// Setup consumed flags (per-session — [FIX-17])
+bool          g_londonConsumed    = false;  // London + Silver Bullet setup consumed
+bool          g_nyConsumed        = false;  // NY setup consumed
+bool          g_sbConsumed        = false;  // [FIX-19] Silver Bullet consumed
+bool          g_setupConsumed     = false;  // General alias (resolved per session in OnTick)
+
+// Daily trade direction guards
+bool          g_tradedBuyToday    = false;
+bool          g_tradedSellToday   = false;
 
 // Pending order tracking
-ulong          g_pendingTicket     = 0;
-int            g_pendingBars       = 0;
+ulong         g_pendingTicket     = 0;
+int           g_pendingBars       = 0;
 
 // Open position tracking
-datetime       g_tradeEntryTime    = 0;      // For max duration check
-bool           g_partialClosed     = false;  // TP1 partial close executed flag
+datetime      g_tradeEntryTime    = 0;
+bool          g_partialClosed     = false;
 
-// PropFirm & risk state
-double         g_initialBalance    = 0.0;   // Set at OnInit — NEVER updated
-double         g_dayStartEquity    = 0.0;   // Reset 00:00 GMT each day
-double         g_weekStartEquity   = 0.0;   // Reset Monday 00:00 GMT
-bool           g_dailyHalt         = false; // Daily loss limit hit
-bool           g_totalHalt         = false; // Total DD hit — permanent until restart
-int            g_consecutiveLosses = 0;     // Win-to-win streak (reset on WIN only)
-int            g_dailyLossCount    = 0;     // Per-day count (reset at midnight)
+// PropFirm state
+double        g_initialBalance    = 0.0;
+double        g_dayStartEquity    = 0.0;
+double        g_weekStartEquity   = 0.0;
+bool          g_dailyHalt         = false;
+bool          g_totalHalt         = false;
+int           g_consecutiveLosses = 0;
+int           g_dailyLossCount    = 0;
 
 // Indicator handles
-int            g_atrH4Handle       = INVALID_HANDLE;
-int            g_atrM15Handle      = INVALID_HANDLE;
-int            g_ema200Handle      = INVALID_HANDLE;
+int           g_atrH4Handle       = INVALID_HANDLE;
+int           g_atrM15Handle      = INVALID_HANDLE;
+int           g_ema200Handle      = INVALID_HANDLE;
 
 // Misc
-double         g_pipSize           = 0.0;
-datetime       g_lastBarTime       = 0;
-datetime       g_lastDayReset      = 0;
-datetime       g_lastWeekReset     = 0;
+double        g_pipSize           = 0.0;
+datetime      g_lastBarTime       = 0;
+datetime      g_lastDayReset      = 0;
+datetime      g_lastWeekReset     = 0;
 
-// Optional filter state (behind toggle flags)
-ENUM_OB_STATE  g_obState           = OB_NONE;
-double         g_obHigh            = 0.0;
-double         g_obLow             = 0.0;
-bool           g_obBullish         = false;
-datetime       g_obTime            = 0;
-bool           g_weeklyBullish     = false;
-double         g_d1Equilibrium     = 0.0;
+// Optional filter state
+ENUM_OB_STATE g_obState           = OB_NONE;
+double        g_obHigh            = 0.0;
+double        g_obLow             = 0.0;
+bool          g_obBullish         = false;
+datetime      g_obTime            = 0;
+bool          g_weeklyBullish     = false;
+double        g_d1Equilibrium     = 0.0;
+
+// [FIX-21] Gate stat counters — reset each day
+int           g_statSweeps        = 0;
+int           g_statFVG           = 0;
+int           g_statDisplacement  = 0;
+int           g_statH4            = 0;
+int           g_statAsianFilter   = 0;
+int           g_statATRFilter     = 0;
+int           g_statOrders        = 0;
 
 //+------------------------------------------------------------------+
 //| LOGGING HELPER                                                     |
@@ -197,38 +232,33 @@ int OnInit()
    if(StringFind(Symbol(), "EURUSD") < 0)
       Print("[MARK1] WARNING: Designed for EURUSD. Current symbol: ", Symbol());
 
-   // Pip size — handles 3/5-digit and 2/4-digit brokers
    int digits = (int)SymbolInfoInteger(Symbol(), SYMBOL_DIGITS);
    g_pipSize  = (digits == 3 || digits == 5)
               ? SymbolInfoDouble(Symbol(), SYMBOL_POINT) * 10.0
               : SymbolInfoDouble(Symbol(), SYMBOL_POINT);
    if(g_pipSize <= 0.0) { Print("[MARK1] INIT ERROR: Invalid pip size."); return INIT_FAILED; }
 
-   // Parameter sanity checks
    if(InpFVGScanBars < 3)
    { Print("[MARK1] INIT ERROR: InpFVGScanBars must be >= 3."); return INIT_PARAMETERS_INCORRECT; }
-   if(InpTP2Ratio <= InpTP1Ratio)
-   { Print("[MARK1] INIT ERROR: InpTP2Ratio must be > InpTP1Ratio."); return INIT_PARAMETERS_INCORRECT; }
+   if(InpTP2RR <= InpTP1RR)
+   { Print("[MARK1] INIT ERROR: InpTP2RR must be > InpTP1RR."); return INIT_PARAMETERS_INCORRECT; }
    if(InpMaxDailyLossPct >= 5.0)
       Print("[MARK1] WARNING: InpMaxDailyLossPct >= FTMO 5% limit. Reduce to stay inside.");
    if(InpMaxTotalDDPct >= 10.0)
       Print("[MARK1] WARNING: InpMaxTotalDDPct >= FTMO 10% limit. Reduce to stay inside.");
 
-   // Indicator handles
    g_atrH4Handle  = iATR(Symbol(), PERIOD_H4,  ATR_H4_PERIOD);
    g_atrM15Handle = iATR(Symbol(), PERIOD_M15, ATR_M15_PERIOD);
    g_ema200Handle = iMA(Symbol(),  PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE);
-   if(g_atrH4Handle  == INVALID_HANDLE) Print("[MARK1] WARNING: H4 ATR handle failed — regime filter passes through.");
-   if(g_atrM15Handle == INVALID_HANDLE) Print("[MARK1] WARNING: M15 ATR handle failed — trailing stop disabled.");
-   if(g_ema200Handle == INVALID_HANDLE) Print("[MARK1] WARNING: D1 EMA200 handle failed — trend filter passes through.");
+   if(g_atrH4Handle  == INVALID_HANDLE) Print("[MARK1] WARNING: H4 ATR handle failed.");
+   if(g_atrM15Handle == INVALID_HANDLE) Print("[MARK1] WARNING: M15 ATR handle failed.");
+   if(g_ema200Handle == INVALID_HANDLE) Print("[MARK1] WARNING: D1 EMA200 handle failed.");
 
-   // Trade object setup
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(InpSlippagePoints);
    g_trade.SetTypeFilling(ORDER_FILLING_RETURN);
    g_trade.LogLevel(LOG_LEVEL_ERRORS);
 
-   // PropFirm baseline — initial balance at EA start, never updated
    g_initialBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
    g_dayStartEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
    g_weekStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -239,8 +269,7 @@ int OnInit()
    UpdateD1Equilibrium();
    UpdateWeeklyBias();
 
-   Log("INIT v4.0 | Balance=" + DoubleToString(g_initialBalance, 2) +
-       " | Pip=" + DoubleToString(g_pipSize, _Digits + 1) +
+   Log("INIT v4.1 | Balance=" + DoubleToString(g_initialBalance, 2) +
        " | MaxDailyDD=" + DoubleToString(InpMaxDailyLossPct, 1) + "%" +
        " | MaxTotalDD="  + DoubleToString(InpMaxTotalDDPct,  1) + "%" +
        " | H4Filter="    + (InpEnableH4Filter    ? "ON" : "OFF") +
@@ -261,54 +290,70 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| OnTick — PropFirm kill switches run EVERY tick                    |
-//|          Bar-open strategy logic runs on new M15 bars only        |
+//| OnTick                                                             |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // ── PROPFIRM KILL SWITCHES (floating equity, every tick) ─────
+   // PropFirm kill switches run EVERY tick (floating equity)
    if(!CheckPropFirmLimits()) return;
 
-   // ── ACTIVE POSITION MANAGEMENT (every tick) ──────────────────
+   // Position management runs EVERY tick
    ManageOpenPositions();
 
-   // ── BAR GATE — strategy logic only runs on new bar ───────────
+   // Bar gate — strategy logic only on new bars
    datetime barTime = (datetime)SeriesInfoInteger(Symbol(), Period(), SERIES_LASTBAR_DATE);
    if(barTime == 0 || barTime == g_lastBarTime) return;
    g_lastBarTime = barTime;
 
-   // ── DAILY / WEEKLY RESET ─────────────────────────────────────
    datetime gmtNow = TimeGMT();
    MqlDateTime gmt;
    TimeToStruct(gmtNow, gmt);
+
    CheckDailyReset(gmt);
    CheckWeeklyReset(gmt);
 
-   // ── POST-RESET HALTS ──────────────────────────────────────────
    if(g_dailyHalt || g_totalHalt) return;
-
-   // ── DAILY LOSS COUNT HALT ─────────────────────────────────────
    if(g_dailyLossCount >= CONSEC_LOSSES_STOP)
    {
-      Log("[HALT] Daily loss count = " + IntegerToString(g_dailyLossCount) + " — trading halted today.");
+      Log("[HALT] Daily loss count = " + IntegerToString(g_dailyLossCount) + " — halted.");
       return;
    }
 
-   // ── ASIAN RANGE ACCUMULATION ──────────────────────────────────
+   // ── ASIAN RANGE ACCUMULATION (00-07 GMT) ──────────────────────
    if(gmt.hour >= InpAsianStartGMT && gmt.hour < InpAsianEndGMT)
    {
       UpdateAsianRange();
       if(g_state == STATE_IDLE) g_state = STATE_AWAITING_SWEEP;
    }
 
-   // ── LOCK ASIAN RANGE AT InpAsianEndGMT (07:00 GMT) ───────────
+   // ── LOCK ASIAN RANGE AT 07:00 GMT ─────────────────────────────
    if(gmt.hour >= InpAsianEndGMT && !g_asianLocked && g_asianHigh > 0.0 && g_asianLow > 0.0)
    {
       g_asianLocked = true;
       double rangePips = (g_asianHigh - g_asianLow) / g_pipSize;
-      Log("[RANGE] LOCKED | High=" + DoubleToString(g_asianHigh, _Digits) +
-          " Low="  + DoubleToString(g_asianLow,  _Digits) +
-          " Range=" + DoubleToString(rangePips, 1) + " pips");
+      Log("[RANGE] ASIAN LOCKED | High=" + DoubleToString(g_asianHigh, _Digits) +
+          " Low=" + DoubleToString(g_asianLow, _Digits) +
+          " Range=" + DoubleToString(rangePips, 1) + "p");
+   }
+
+   // [FIX-18] ACCUMULATE LONDON RANGE (07-12 GMT)
+   if(gmt.hour >= LONDON_START_GMT && gmt.hour < LONDON_RANGE_END)
+   {
+      double hi = iHigh(Symbol(), Period(), 1);
+      double lo = iLow(Symbol(),  Period(), 1);
+      if(!g_londonRangeSet || hi > g_londonHigh) g_londonHigh = hi;
+      if(!g_londonRangeSet || lo < g_londonLow)  g_londonLow  = lo;
+      g_londonRangeSet = true;
+   }
+
+   // [FIX-19] ACCUMULATE NY MORNING RANGE (13-15 GMT) for Silver Bullet reference
+   if(gmt.hour >= NY_START_GMT && gmt.hour < NY_MORNING_END)
+   {
+      double hi = iHigh(Symbol(), Period(), 1);
+      double lo = iLow(Symbol(),  Period(), 1);
+      if(!g_nyMorningRangeSet || hi > g_nyMorningHigh) g_nyMorningHigh = hi;
+      if(!g_nyMorningRangeSet || lo < g_nyMorningLow)  g_nyMorningLow  = lo;
+      g_nyMorningRangeSet = true;
    }
 
    // ── GATE 1: SESSION FILTER ────────────────────────────────────
@@ -327,73 +372,105 @@ void OnTick()
       return;
    }
 
-   // ── STATE MACHINE ─────────────────────────────────────────────
-   switch(g_state)
+   bool inLondon  = (gmt.hour >= LONDON_START_GMT   && gmt.hour < LONDON_END_GMT);
+   bool inSilver  = (gmt.hour >= SILVER_BULLET_START && gmt.hour < SILVER_BULLET_END);
+   bool inNY      = (gmt.hour >= NY_START_GMT        && gmt.hour < NY_END_GMT);
+
+   // ──────────────────────────────────────────────────────────────
+   // LONDON SESSION (07-10 GMT): sweeps off Asian range
+   // ──────────────────────────────────────────────────────────────
+   if(inLondon && !g_londonConsumed)
    {
-      case STATE_AWAITING_SWEEP:
-         if(g_asianLocked && !g_setupConsumed)
+      if(g_state == STATE_AWAITING_SWEEP || g_state == STATE_IDLE)
+      {
+         if(g_asianLocked && Gate3_LondonSweep())
+            g_state = STATE_AWAITING_FVG;
+      }
+
+      if(g_state == STATE_AWAITING_FVG)
+      {
+         if(Gate5_FVGDetect(g_sweepBullish, g_sweepExtreme))
          {
-            bool inJudas  = (gmt.hour >= LONDON_START_GMT  && gmt.hour < LONDON_END_GMT);
-            bool inSilver = (gmt.hour >= SILVER_BULLET_START && gmt.hour < SILVER_BULLET_END);
-            bool inNY     = (gmt.hour >= NY_START_GMT       && gmt.hour < NY_END_GMT);
-            if((inJudas || inSilver || inNY) && Gate3_SweepConfirmed())
+            g_statFVG++;
+            double m = Gate7_HTFBias(g_sweepBullish);
+            Gate6_PlaceLimitOrder(g_sweepBullish, g_sweepExtreme, m, false);
+            if(g_pendingTicket != 0) { g_state = STATE_PENDING_ENTRY; g_londonConsumed = true; }
+         }
+         // [FIX-17] Do NOT set g_londonConsumed on failed FVG scan —
+         // allow retry on next bar until London window closes.
+      }
+   }
+
+   // End of London window — consume if no order placed
+   if(!g_londonConsumed && gmt.hour == LONDON_END_GMT && gmt.min == 0)
+   {
+      if(g_state == STATE_AWAITING_FVG || g_state == STATE_AWAITING_SWEEP)
+         g_state = STATE_IDLE;
+   }
+
+   // ──────────────────────────────────────────────────────────────
+   // [FIX-19] SILVER BULLET (10-11 GMT): independent model
+   // Sweeps the NY morning range (or Asian range if NY range not ready)
+   // ──────────────────────────────────────────────────────────────
+   if(inSilver && !g_sbConsumed)
+   {
+      // Silver Bullet sweeps the Asian high/low (opening range at this time)
+      if(!g_sbSweepDetected)
+         Gate3_SilverBulletSweep();
+
+      if(g_sbSweepDetected)
+      {
+         if(Gate5_FVGDetect(g_sbSweepBullish, g_sbSweepExtreme))
+         {
+            double m = Gate7_HTFBias(g_sbSweepBullish);
+            Gate6_PlaceLimitOrder(g_sbSweepBullish, g_sbSweepExtreme, m, true);
+            g_sbConsumed = true;
+            if(g_pendingTicket != 0) g_state = STATE_PENDING_ENTRY;
+         }
+      }
+   }
+
+   // ──────────────────────────────────────────────────────────────
+   // [FIX-18] NY SESSION (13-16 GMT): sweeps the London range
+   // ──────────────────────────────────────────────────────────────
+   if(inNY && !g_nyConsumed)
+   {
+      // Need London range to be set before NY can sweep it
+      if(g_londonRangeSet)
+      {
+         if(g_state == STATE_IDLE || g_state == STATE_AWAITING_SWEEP)
+         {
+            if(Gate3_NYSweep())
                g_state = STATE_AWAITING_FVG;
          }
-         break;
 
-      case STATE_AWAITING_FVG:
-         if(!g_setupConsumed)
+         if(g_state == STATE_AWAITING_FVG)
          {
-            if(Gate5_FVGDetect())
+            if(Gate5_FVGDetect(g_sweepBullish, g_sweepExtreme))
             {
-               double lotsMultiplier = Gate7_HTFBias();
-               Gate6_PlaceLimitOrder(lotsMultiplier);
-               if(g_pendingTicket != 0)
-                  g_state = STATE_PENDING_ENTRY;
-            }
-            else
-            {
-               // BUG-2 FIX: consume setup only once all kill zones have closed.
-               // While still inside a valid KZ, re-scan on every bar —
-               // the FVG may form later in the same session.
-               bool inAnyKZ = (gmt.hour >= LONDON_START_GMT && gmt.hour < NY_END_GMT);
-               if(!inAnyKZ)
-               {
-                  Log("[G5] No FVG found and kill zone closed — setup consumed.");
-                  g_setupConsumed = true;
-               }
+               g_statFVG++;
+               double m = Gate7_HTFBias(g_sweepBullish);
+               Gate6_PlaceLimitOrder(g_sweepBullish, g_sweepExtreme, m, false);
+               if(g_pendingTicket != 0) { g_state = STATE_PENDING_ENTRY; g_nyConsumed = true; }
             }
          }
-         break;
-
-      case STATE_PENDING_ENTRY:
-         ManagePendingOrders();
-         break;
-
-      case STATE_IN_TRADE:
-         // All management is in ManageOpenPositions() on every tick.
-         break;
-
-      default:
-         break;
+      }
    }
+
+   // Manage pending order expiry
+   if(g_state == STATE_PENDING_ENTRY)
+      ManagePendingOrders();
 }
 
 //+------------------------------------------------------------------+
-//| PROPFIRM KILL SWITCHES                                            |
-//| Evaluates FLOATING equity (open trades count) every tick.        |
-//| Returns false → caller must return immediately, no new orders.   |
-//|                                                                    |
-//| Daily: (dayStartEquity - currentEquity) / dayStartEquity         |
-//| Total: (initialBalance  - currentEquity) / initialBalance        |
+//| PROPFIRM KILL SWITCHES — every tick, floating equity             |
 //+------------------------------------------------------------------+
 bool CheckPropFirmLimits()
 {
-   if(g_totalHalt) return false;  // Permanent halt until EA restart
+   if(g_totalHalt) return false;
 
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
 
-   // Total drawdown from initial balance at EA start
    if(g_initialBalance > 0.0)
    {
       double totalDDPct = (g_initialBalance - equity) / g_initialBalance * 100.0;
@@ -403,12 +480,11 @@ bool CheckPropFirmLimits()
          CloseAllOrders();
          CloseAllPositions();
          Print("[MARK1] !!! TOTAL DD LIMIT BREACHED: ", DoubleToString(totalDDPct, 2),
-               "% >= ", DoubleToString(InpMaxTotalDDPct, 1), "% — PERMANENT EA HALT !!!");
+               "% >= ", DoubleToString(InpMaxTotalDDPct, 1), "% — PERMANENT HALT !!!");
          return false;
       }
    }
 
-   // Daily loss from today's opening equity (floating — open trades included)
    if(!g_dailyHalt && g_dayStartEquity > 0.0)
    {
       double dailyDDPct = (g_dayStartEquity - equity) / g_dayStartEquity * 100.0;
@@ -429,17 +505,14 @@ bool CheckPropFirmLimits()
 
 //+------------------------------------------------------------------+
 //| GATE 1 — SESSION FILTER                                           |
-//| ICT concept: Only trade during kill zones where institutional     |
-//| order flow is highest: London Open (07-10 GMT), Silver Bullet     |
-//| (10-11 GMT), NY Open (13-16 GMT). Reject Friday after 20:00 GMT  |
-//| to prevent entering trades that may be held over weekend gaps.    |
+//| ICT: Only trade London (07-10), Silver Bullet (10-11), NY (13-16)|
+//| Reject Friday after 20:00 GMT — no overnight/weekend exposure.   |
 //+------------------------------------------------------------------+
 bool Gate1_SessionFilter(const MqlDateTime &gmt)
 {
-   // FTMO rule: no new trades on Friday after 20:00 GMT
    if(gmt.day_of_week == 5 && gmt.hour >= FRIDAY_CUTOFF_GMT)
    {
-      Log("[G1] FAIL — Friday " + IntegerToString(FRIDAY_CUTOFF_GMT) + ":00 GMT cutoff.");
+      Log("[G1] FAIL — Friday cutoff.");
       return false;
    }
 
@@ -452,10 +525,8 @@ bool Gate1_SessionFilter(const MqlDateTime &gmt)
 
 //+------------------------------------------------------------------+
 //| GATE 2 — ASIAN RANGE VALIDITY                                     |
-//| ICT concept: The Asian session defines the liquidity pools —      |
-//| buy-side above the high, sell-side below the low. A range < 8p   |
-//| means no real pools to sweep. A range > 40p signals the sweep    |
-//| likely already happened or volatility is structurally excessive. |
+//| ICT: Range < 8p = no meaningful liquidity pools to sweep.        |
+//| Range > 50p = sweep likely already occurred / day too volatile.  |
 //+------------------------------------------------------------------+
 bool Gate2_AsianRange()
 {
@@ -463,32 +534,30 @@ bool Gate2_AsianRange()
 
    double rangePips = (g_asianHigh - g_asianLow) / g_pipSize;
 
-   if(rangePips < (double)InpMinAsianRangePips)
+   if(rangePips < InpMinAsianRangePips)
    {
+      g_statAsianFilter++;
       Log("[G2] FAIL — Range " + DoubleToString(rangePips, 1) + "p < min " +
-          IntegerToString(InpMinAsianRangePips) + "p. Skipping day.");
+          DoubleToString(InpMinAsianRangePips, 0) + "p. Skip day.");
       return false;
    }
-   if(rangePips > (double)InpMaxAsianRangePips)
+   if(rangePips > InpMaxAsianRangePips)
    {
+      g_statAsianFilter++;
       Log("[G2] FAIL — Range " + DoubleToString(rangePips, 1) + "p > max " +
-          IntegerToString(InpMaxAsianRangePips) + "p. Skipping day.");
+          DoubleToString(InpMaxAsianRangePips, 0) + "p. Skip day.");
       return false;
    }
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| GATE 3 — LIQUIDITY SWEEP CONFIRMATION (most critical fix)         |
-//| ICT concept: The Judas Swing is a deliberate false breakout to    |
-//| trigger retail stop clusters above/below the Asian range. BOTH    |
-//| conditions must hold on the SAME M15 candle:                      |
-//|  (1) Wick extends at least InpSweepConfirmPips beyond level       |
-//|  (2) Candle CLOSES back inside the Asian range                    |
-//| A breakout candle that does NOT close back inside is a genuine    |
-//| breakout, not a stop hunt — no entry signal without this close.   |
+//| GATE 3a — LONDON JUDAS SWEEP (07-10 GMT, sweeps Asian range)     |
+//| ICT: Wick extends ≥ InpSweepConfirmPips beyond Asian high/low    |
+//| AND the M15 candle closes BACK inside the Asian range.           |
+//| Both conditions on the SAME candle confirm stop-hunt, not breakout|
 //+------------------------------------------------------------------+
-bool Gate3_SweepConfirmed()
+bool Gate3_LondonSweep()
 {
    if(!g_asianLocked) return false;
 
@@ -497,13 +566,11 @@ bool Gate3_SweepConfirmed()
    double barClose = iClose(Symbol(), Period(), 1);
    double minWick  = (double)InpSweepConfirmPips * g_pipSize;
 
-   // Bearish sweep: wick pierces Asian high and closes back inside range
    bool bearish = (barHigh  > g_asianHigh + minWick) &&
                   (barClose < g_asianHigh) &&
                   (barClose > g_asianLow)  &&
                   !g_tradedSellToday;
 
-   // Bullish sweep: wick pierces Asian low and closes back inside range
    bool bullish = (barLow   < g_asianLow - minWick) &&
                   (barClose > g_asianLow)  &&
                   (barClose < g_asianHigh) &&
@@ -514,10 +581,10 @@ bool Gate3_SweepConfirmed()
       g_sweepBullish = false;
       g_sweepExtreme = barHigh;
       g_sweepTime    = iTime(Symbol(), Period(), 1);
-      Log("[G3] PASS BEARISH SWEEP | AsianHigh=" + DoubleToString(g_asianHigh, _Digits) +
-          " WickHigh=" + DoubleToString(barHigh, _Digits) +
-          " Wick=" + DoubleToString((barHigh - g_asianHigh) / g_pipSize, 1) + "p" +
-          " Close=" + DoubleToString(barClose, _Digits));
+      g_statSweeps++;
+      Log("[G3L] BEARISH Sweep | AH=" + DoubleToString(g_asianHigh, _Digits) +
+          " WickH=" + DoubleToString(barHigh, _Digits) +
+          " Wick=" + DoubleToString((barHigh - g_asianHigh) / g_pipSize, 1) + "p");
       return true;
    }
    if(bullish)
@@ -525,24 +592,120 @@ bool Gate3_SweepConfirmed()
       g_sweepBullish = true;
       g_sweepExtreme = barLow;
       g_sweepTime    = iTime(Symbol(), Period(), 1);
-      Log("[G3] PASS BULLISH SWEEP | AsianLow=" + DoubleToString(g_asianLow, _Digits) +
-          " WickLow=" + DoubleToString(barLow, _Digits) +
-          " Wick=" + DoubleToString((g_asianLow - barLow) / g_pipSize, 1) + "p" +
-          " Close=" + DoubleToString(barClose, _Digits));
+      g_statSweeps++;
+      Log("[G3L] BULLISH Sweep | AL=" + DoubleToString(g_asianLow, _Digits) +
+          " WickL=" + DoubleToString(barLow, _Digits) +
+          " Wick=" + DoubleToString((g_asianLow - barLow) / g_pipSize, 1) + "p");
       return true;
    }
    return false;
 }
 
 //+------------------------------------------------------------------+
-//| GATE 4 — DISPLACEMENT CANDLE (called from Gate5 scan loop)        |
-//| ICT concept: After the sweep, institutional commitment must show  |
-//| as a strong purposeful candle in the OPPOSITE direction — the     |
-//| smart money reversing from the swept liquidity pool. Small/doji   |
-//| candles = indecision, not confirmed institutional entry.          |
-//| Both thresholds must pass: ≥60% body ratio AND ≥6 pips body.     |
+//| GATE 3b — [FIX-18] NY SWEEP (13-16 GMT, sweeps London range)     |
+//| ICT: By NY open the Asian range is 13h old and irrelevant.       |
+//| NY Judas swing instead sweeps the London session high/low         |
+//| (07-12 GMT range), which is the relevant recent liquidity pool.  |
 //+------------------------------------------------------------------+
-bool Gate4_Displacement(int barIndex)
+bool Gate3_NYSweep()
+{
+   if(!g_londonRangeSet || g_londonHigh <= 0.0 || g_londonLow <= 0.0) return false;
+
+   double barHigh  = iHigh(Symbol(), Period(), 1);
+   double barLow   = iLow(Symbol(),  Period(), 1);
+   double barClose = iClose(Symbol(), Period(), 1);
+   double minWick  = (double)InpSweepConfirmPips * g_pipSize;
+
+   bool bearish = (barHigh  > g_londonHigh + minWick) &&
+                  (barClose < g_londonHigh) &&
+                  (barClose > g_londonLow)  &&
+                  !g_tradedSellToday;
+
+   bool bullish = (barLow   < g_londonLow - minWick) &&
+                  (barClose > g_londonLow)  &&
+                  (barClose < g_londonHigh) &&
+                  !g_tradedBuyToday;
+
+   if(bearish)
+   {
+      g_sweepBullish = false;
+      g_sweepExtreme = barHigh;
+      g_sweepTime    = iTime(Symbol(), Period(), 1);
+      g_statSweeps++;
+      Log("[G3N] BEARISH NY Sweep | LondonHigh=" + DoubleToString(g_londonHigh, _Digits) +
+          " WickH=" + DoubleToString(barHigh, _Digits) +
+          " Wick=" + DoubleToString((barHigh - g_londonHigh) / g_pipSize, 1) + "p");
+      return true;
+   }
+   if(bullish)
+   {
+      g_sweepBullish = true;
+      g_sweepExtreme = barLow;
+      g_sweepTime    = iTime(Symbol(), Period(), 1);
+      g_statSweeps++;
+      Log("[G3N] BULLISH NY Sweep | LondonLow=" + DoubleToString(g_londonLow, _Digits) +
+          " WickL=" + DoubleToString(barLow, _Digits) +
+          " Wick=" + DoubleToString((g_londonLow - barLow) / g_pipSize, 1) + "p");
+      return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| GATE 3c — [FIX-19] SILVER BULLET SWEEP (10-11 GMT)               |
+//| ICT: Silver Bullet is a standalone ICT model with its own         |
+//| reference range. Uses Asian range as reference at 10:00 GMT.     |
+//| Sweep + close-back-inside on same M15 candle required.           |
+//| Stored in independent g_sbSweep* globals.                        |
+//+------------------------------------------------------------------+
+void Gate3_SilverBulletSweep()
+{
+   if(!g_asianLocked) return;
+
+   double barHigh  = iHigh(Symbol(), Period(), 1);
+   double barLow   = iLow(Symbol(),  Period(), 1);
+   double barClose = iClose(Symbol(), Period(), 1);
+   double minWick  = (double)InpSweepConfirmPips * g_pipSize;
+
+   // Use Asian range as Silver Bullet reference
+   double refHigh = g_asianHigh;
+   double refLow  = g_asianLow;
+
+   bool bearish = (barHigh  > refHigh + minWick) &&
+                  (barClose < refHigh) &&
+                  (barClose > refLow)  &&
+                  !g_tradedSellToday;
+
+   bool bullish = (barLow   < refLow - minWick) &&
+                  (barClose > refLow)  &&
+                  (barClose < refHigh) &&
+                  !g_tradedBuyToday;
+
+   if(bearish)
+   {
+      g_sbSweepDetected = true;
+      g_sbSweepBullish  = false;
+      g_sbSweepExtreme  = barHigh;
+      g_statSweeps++;
+      Log("[G3S] BEARISH SilverBullet Sweep | Ref=" + DoubleToString(refHigh, _Digits));
+   }
+   else if(bullish)
+   {
+      g_sbSweepDetected = true;
+      g_sbSweepBullish  = true;
+      g_sbSweepExtreme  = barLow;
+      g_statSweeps++;
+      Log("[G3S] BULLISH SilverBullet Sweep | Ref=" + DoubleToString(refLow, _Digits));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| GATE 4 — DISPLACEMENT CANDLE                                      |
+//| ICT: Impulse candle after sweep must have strong directional body |
+//| Body ≥ 60% of candle range AND ≥ 6 pips. Direction must OPPOSE  |
+//| the sweep (bullish sweep → bullish displacement candle).          |
+//+------------------------------------------------------------------+
+bool Gate4_Displacement(int barIndex, bool isBullishSweep)
 {
    if(InpMinDisplacementBodyPct == 0 && InpMinDisplacementPips == 0) return true;
 
@@ -554,42 +717,42 @@ bool Gate4_Displacement(int barIndex)
 
    if(range <= 0.0) return false;
 
-   // Direction must OPPOSE the sweep
-   if( g_sweepBullish && close <= open) return false;  // Bullish sweep → need bullish displacement
-   if(!g_sweepBullish && close >= open) return false;  // Bearish sweep → need bearish displacement
+   if( isBullishSweep && close <= open) return false;
+   if(!isBullishSweep && close >= open) return false;
 
    double body    = MathAbs(close - open);
    double bodyPct = (body / range) * 100.0;
 
    if(bodyPct < (double)InpMinDisplacementBodyPct)
    {
+      g_statDisplacement++;
       Log("[G4] FAIL body=" + DoubleToString(bodyPct, 1) + "% < " +
-          IntegerToString(InpMinDisplacementBodyPct) + "% @ bar[" + IntegerToString(barIndex) + "]");
+          IntegerToString(InpMinDisplacementBodyPct) + "%");
       return false;
    }
    if(body < (double)InpMinDisplacementPips * g_pipSize)
    {
+      g_statDisplacement++;
       Log("[G4] FAIL body=" + DoubleToString(body / g_pipSize, 1) + "p < " +
-          IntegerToString(InpMinDisplacementPips) + "p @ bar[" + IntegerToString(barIndex) + "]");
+          IntegerToString(InpMinDisplacementPips) + "p");
       return false;
    }
 
    Log("[G4] PASS body=" + DoubleToString(bodyPct, 1) + "% / " +
-       DoubleToString(body / g_pipSize, 1) + "p @ bar[" + IntegerToString(barIndex) + "]");
+       DoubleToString(body / g_pipSize, 1) + "p");
    return true;
 }
 
 //+------------------------------------------------------------------+
 //| GATE 5 — FVG DETECTION                                            |
-//| ICT concept: A Fair Value Gap is a price imbalance where buyers   |
-//| and sellers did not transact — price moved so fast a void is left.|
-//| Price gravitates back to fill this gap, creating OTE entries.    |
-//| 3-candle pattern (bar indices: newer=offset, older=offset+2):     |
-//|   Bullish FVG: candle[offset+2].high < candle[offset].low        |
-//|   Bearish FVG: candle[offset+2].low  > candle[offset].high       |
-//| Gate4 displacement check applies to the middle candle [offset+1]. |
+//| ICT: Fair Value Gap (price imbalance) is the OTE entry zone.     |
+//| Scans last InpFVGScanBars bars for a 3-candle FVG pattern.       |
+//|   Bullish FVG: bar[i+2].high < bar[i].low  (gap upward)          |
+//|   Bearish FVG: bar[i+2].low  > bar[i].high (gap downward)        |
+//| Gate4 displacement applied to middle candle [i+1].               |
+//| Returns FIRST (most recent) valid FVG that passes all checks.    |
 //+------------------------------------------------------------------+
-bool Gate5_FVGDetect()
+bool Gate5_FVGDetect(bool isBullishSweep, double sweepExtreme)
 {
    if(Bars(Symbol(), Period()) < InpFVGScanBars + 3) return false;
 
@@ -600,34 +763,32 @@ bool Gate5_FVGDetect()
       double high_old = iHigh(Symbol(), Period(), offset + 2);
       double low_old  = iLow(Symbol(),  Period(), offset + 2);
 
-      if(g_sweepBullish)
+      if(isBullishSweep)
       {
-         // Bullish FVG: gap above older candle's high, below newer candle's low
          if(high_old >= low_new) continue;
 
          double fvgPips = (low_new - high_old) / g_pipSize;
-         if(fvgPips < (double)InpMinFVGPips) continue;
-         if(!Gate4_Displacement(offset + 1))  continue;
+         if(fvgPips < InpMinFVGPips) continue;
+         if(!Gate4_Displacement(offset + 1, isBullishSweep)) continue;
 
          g_fvgLow  = high_old;
          g_fvgHigh = low_new;
-         Log("[G5] PASS BULLISH FVG [off=" + IntegerToString(offset) + "] " +
+         Log("[G5] BULLISH FVG [off=" + IntegerToString(offset) + "] " +
              DoubleToString(g_fvgLow, _Digits) + "–" + DoubleToString(g_fvgHigh, _Digits) +
              " (" + DoubleToString(fvgPips, 1) + "p)");
          return true;
       }
       else
       {
-         // Bearish FVG: gap below older candle's low, above newer candle's high
          if(low_old <= high_new) continue;
 
          double fvgPips = (low_old - high_new) / g_pipSize;
-         if(fvgPips < (double)InpMinFVGPips) continue;
-         if(!Gate4_Displacement(offset + 1))  continue;
+         if(fvgPips < InpMinFVGPips) continue;
+         if(!Gate4_Displacement(offset + 1, isBullishSweep)) continue;
 
          g_fvgLow  = high_new;
          g_fvgHigh = low_old;
-         Log("[G5] PASS BEARISH FVG [off=" + IntegerToString(offset) + "] " +
+         Log("[G5] BEARISH FVG [off=" + IntegerToString(offset) + "] " +
              DoubleToString(g_fvgLow, _Digits) + "–" + DoubleToString(g_fvgHigh, _Digits) +
              " (" + DoubleToString(fvgPips, 1) + "p)");
          return true;
@@ -638,71 +799,80 @@ bool Gate5_FVGDetect()
 
 //+------------------------------------------------------------------+
 //| GATE 6 — OTE LIMIT ORDER PLACEMENT                                |
-//| ICT concept: The Optimal Trade Entry is the 50% midpoint of the  |
-//| FVG, where institutional resting orders are concentrated. Using a |
-//| LIMIT order means we only enter if price RETRACES to OTE — if it |
-//| does not, the setup is simply skipped (no chasing).              |
+//| ICT: Entry at 50% of FVG (OTE). Limit order ensures price must   |
+//| retrace to OTE level — no chasing entries.                       |
 //|                                                                    |
-//| Dynamic SL = AsianRange × 1.1, clamped to [15, 50] pips.        |
-//| This adapts automatically to each day's actual market structure   |
-//| instead of using a fixed pip value that ignores daily volatility. |
+//| [FIX-17] Filter rejections (H4, Bias, PD, OB) do NOT consume     |
+//| the setup — they return silently so next session can retry.      |
+//| Only geometry failures (entry vs bid/ask) and successful orders  |
+//| mark the session as consumed.                                     |
 //|                                                                    |
-//| All PropFirm and adaptive risk adjustments applied to lot size:  |
-//|   2+ consecutive losses → InpRiskPercent × 0.5                   |
-//|   Weekly DD soft cap hit → cap at 50% of effective risk          |
-//|   Extreme ATR regime (>120p H4) → cap at 0.25%                  |
-//|   H4 bias disagrees (Gate7) → lot multiplier = 0.5               |
+//| [FIX-20] SL = structure-based: Asian low/high ± 20% of range.   |
+//| Clamped to [12, 45] pips for consistency.                        |
+//|                                                                    |
+//| isSlverBullet=true: uses InpSilverBulletSLPips as fixed SL.      |
 //+------------------------------------------------------------------+
-void Gate6_PlaceLimitOrder(double lotsMultiplier = 1.0)
+void Gate6_PlaceLimitOrder(bool isBullishSweep, double sweepExtreme,
+                           double lotsMultiplier, bool isSilverBullet)
 {
    if(g_fvgHigh <= g_fvgLow) return;
 
-   // --- Optional filters ─────────────────────────────────────────
+   // [FIX-17] Optional filters — return without consuming if rejected
    if(InpEnableWeeklyBias)
    {
-      if( g_sweepBullish && !g_weeklyBullish) { Log("[G6] SKIP — weekly=BEAR, want BUY.");  g_setupConsumed=true; return; }
-      if(!g_sweepBullish &&  g_weeklyBullish) { Log("[G6] SKIP — weekly=BULL, want SELL."); g_setupConsumed=true; return; }
+      if( isBullishSweep && !g_weeklyBullish) { Log("[G6] WeeklyBias rejects BUY — retry next session."); return; }
+      if(!isBullishSweep &&  g_weeklyBullish) { Log("[G6] WeeklyBias rejects SELL — retry next session."); return; }
    }
 
    if(InpEnablePDFilter && g_d1Equilibrium > 0.0)
    {
       double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
       double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
-      if( g_sweepBullish && ask >= g_d1Equilibrium) { Log("[G6] SKIP — BUY in D1 premium.");  g_setupConsumed=true; return; }
-      if(!g_sweepBullish && bid <= g_d1Equilibrium) { Log("[G6] SKIP — SELL in D1 discount."); g_setupConsumed=true; return; }
+      if( isBullishSweep && ask >= g_d1Equilibrium) { Log("[G6] PD filter rejects BUY."); return; }
+      if(!isBullishSweep && bid <= g_d1Equilibrium) { Log("[G6] PD filter rejects SELL."); return; }
    }
 
-   if(InpEnableTrendFilter && !IsTrendAligned(g_sweepBullish))
-   { Log("[G6] SKIP — D1 EMA200 trend disagrees."); g_setupConsumed=true; return; }
+   if(InpEnableTrendFilter && !IsTrendAligned(isBullishSweep))
+   { Log("[G6] Trend filter rejects — retry."); return; }
 
    if(InpEnableOBFilter)
    {
       DetectOrderBlock();
-      if(g_obState == OB_NONE)
-         { Log("[G6] SKIP — no valid OB found."); g_setupConsumed=true; return; }
+      if(g_obState == OB_NONE)       { Log("[G6] OB filter — no OB, retry."); return; }
       double ageH = (g_obTime > 0) ? (double)(TimeCurrent() - g_obTime) / 3600.0 : 0.0;
-      if(ageH > (double)InpOBMaxAgeHours)
-         { Log("[G6] SKIP — OB stale (" + DoubleToString(ageH, 1) + "h)."); g_obState=OB_NONE; g_setupConsumed=true; return; }
+      if(ageH > (double)InpOBMaxAgeHours) { g_obState = OB_NONE; Log("[G6] OB stale, retry."); return; }
       double curMid = (SymbolInfoDouble(Symbol(), SYMBOL_ASK) + SymbolInfoDouble(Symbol(), SYMBOL_BID)) * 0.5;
       double dist   = MathMin(MathAbs(curMid - g_obHigh), MathAbs(curMid - g_obLow));
-      if(dist > InpOBProximityPips * g_pipSize)
-         { Log("[G6] SKIP — too far from OB."); g_setupConsumed=true; return; }
+      if(dist > InpOBProximityPips * g_pipSize) { Log("[G6] Too far from OB, retry."); return; }
    }
 
-   // --- OTE entry: InpOTEPercent% into FVG ──────────────────────
+   // Also check H4 — if disagreement, reduce lots (handled by lotsMultiplier from Gate7)
+   // Gate7 already logged its result.
+
+   // OTE entry price
    double fvgRange   = g_fvgHigh - g_fvgLow;
    double otePct     = (double)InpOTEPercent / 100.0;
    double entryPrice, slPrice;
    ENUM_ORDER_TYPE orderType;
 
-   // --- Dynamic SL: AsianRange × SL_RANGE_MULTIPLE, clamped ─────
-   double asianRange = g_asianHigh - g_asianLow;
-   double slRaw      = asianRange * SL_RANGE_MULTIPLE;
-   double slMin      = (double)MIN_SL_PIPS * g_pipSize;
-   double slMax      = (double)MAX_SL_PIPS * g_pipSize;
-   double slDistance = MathMax(slMin, MathMin(slMax, slRaw));
+   // [FIX-20] Structure-based SL: asianLow - 20% of Asian range (for longs)
+   //                               asianHigh + 20% of Asian range (for shorts)
+   double slPips;
+   if(isSilverBullet)
+   {
+      slPips = InpSilverBulletSLPips;
+   }
+   else
+   {
+      double asianRange     = g_asianHigh - g_asianLow;
+      double asianRangePips = asianRange / g_pipSize;
+      slPips = asianRangePips * SL_STRUCTURE_BUFFER;
+      if(slPips < (double)MIN_SL_PIPS) slPips = (double)MIN_SL_PIPS;
+      if(slPips > (double)MAX_SL_PIPS) slPips = (double)MAX_SL_PIPS;
+   }
+   double slDistance = slPips * g_pipSize;
 
-   if(g_sweepBullish)
+   if(isBullishSweep)
    {
       entryPrice = NormalizeDouble(g_fvgLow + fvgRange * otePct, _Digits);
       slPrice    = NormalizeDouble(g_asianLow - slDistance, _Digits);
@@ -711,8 +881,8 @@ void Gate6_PlaceLimitOrder(double lotsMultiplier = 1.0)
       if(entryPrice >= ask)
       {
          Log("[G6] SKIP BUY — entry " + DoubleToString(entryPrice, _Digits) +
-             " >= Ask " + DoubleToString(ask, _Digits) + " (already above FVG).");
-         g_setupConsumed = true; return;
+             " >= Ask " + DoubleToString(ask, _Digits));
+         return; // [FIX-17] geometry failure — don't retry, but don't block session either
       }
    }
    else
@@ -724,38 +894,37 @@ void Gate6_PlaceLimitOrder(double lotsMultiplier = 1.0)
       if(entryPrice <= bid)
       {
          Log("[G6] SKIP SELL — entry " + DoubleToString(entryPrice, _Digits) +
-             " <= Bid " + DoubleToString(bid, _Digits) + " (already below FVG).");
-         g_setupConsumed = true; return;
+             " <= Bid " + DoubleToString(bid, _Digits));
+         return;
       }
    }
 
-   // --- Risk calculation (all adjustments) ──────────────────────
+   // Risk calculation
    double riskPct = InpRiskPercent;
    if(g_consecutiveLosses >= CONSEC_LOSSES_HALF) riskPct = InpRiskPercent * 0.5;
-   if(IsWeeklyCapHit())      riskPct = MathMin(riskPct, InpRiskPercent * 0.5);
-   if(IsExtremeATRRegime())  riskPct = MathMin(riskPct, 0.25);
-   riskPct *= lotsMultiplier; // Gate7 soft adjustment
+   if(IsWeeklyCapHit())     riskPct = MathMin(riskPct, InpRiskPercent * 0.5);
+   if(IsExtremeATRRegime()) riskPct = MathMin(riskPct, 0.25);
+   riskPct *= lotsMultiplier;
 
-   double equity       = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskAmount   = equity * (riskPct / 100.0);
-   double slPriceDist  = MathAbs(entryPrice - slPrice);
-   double totalLots    = CalculateLotSize(slPriceDist, riskAmount);
+   double equity      = AccountInfoDouble(ACCOUNT_EQUITY);
+   double riskAmount  = equity * (riskPct / 100.0);
+   double slPriceDist = MathAbs(entryPrice - slPrice);
+   double totalLots   = CalculateLotSize(slPriceDist, riskAmount);
 
    if(totalLots <= 0.0)
    {
-      Log("[G6] ERROR: Calculated lots = 0. Check SL distance / risk. Skip.");
-      g_setupConsumed = true;
+      Log("[G6] ERROR: Lots = 0. Skip.");
       return;
    }
 
-   // --- TP at InpTP2Ratio × R; TP1 (1R) managed via partial close ─
    double risk = MathAbs(entryPrice - slPrice);
-   double tp2  = g_sweepBullish
-               ? NormalizeDouble(entryPrice + InpTP2Ratio * risk, _Digits)
-               : NormalizeDouble(entryPrice - InpTP2Ratio * risk, _Digits);
+   double tp2  = isBullishSweep
+               ? NormalizeDouble(entryPrice + InpTP2RR * risk, _Digits)
+               : NormalizeDouble(entryPrice - InpTP2RR * risk, _Digits);
 
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ||
-   !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)) { Log("[G6] Trade not allowed by terminal settings."); return; }
+      !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
+   { Log("[G6] Trade not allowed by terminal."); return; }
 
    bool result = (orderType == ORDER_TYPE_BUY_LIMIT)
       ? g_trade.BuyLimit( totalLots, entryPrice, Symbol(), slPrice, tp2, 0, 0, "MARK1-OTE")
@@ -765,64 +934,55 @@ void Gate6_PlaceLimitOrder(double lotsMultiplier = 1.0)
    {
       g_pendingTicket = g_trade.ResultOrder();
       g_pendingBars   = 0;
-      g_setupConsumed = true;
       g_partialClosed = false;
+      g_statOrders++;
 
       Log("[G6] ORDER PLACED | " + EnumToString(orderType) +
           " Entry=" + DoubleToString(entryPrice, _Digits) +
           " SL=" + DoubleToString(slPrice, _Digits) +
           " TP=" + DoubleToString(tp2, _Digits) +
           " Lots=" + DoubleToString(totalLots, 2) +
-          " SLpips=" + DoubleToString(slPriceDist / g_pipSize, 1) +
+          " SLpips=" + DoubleToString(slPips, 1) +
           " EffRisk=" + DoubleToString(riskPct, 3) + "%" +
           " Ticket=" + IntegerToString(g_pendingTicket) +
-          " ConsecLoss=" + IntegerToString(g_consecutiveLosses) +
-          " WeeklyCap=" + (IsWeeklyCapHit() ? "YES" : "NO"));
+          " SB=" + (isSilverBullet ? "YES" : "NO"));
    }
    else
    {
       Log("[G6] ORDER FAILED | RC=" + IntegerToString(g_trade.ResultRetcode()) +
           " " + g_trade.ResultRetcodeDescription());
-      g_setupConsumed = true;
    }
 }
 
 //+------------------------------------------------------------------+
-//| GATE 7 — H4 BIAS CONFIRMATION (soft: adjusts lots, does not skip)|
-//| ICT concept: Higher timeframe Break of Structure (BOS) defines    |
-//| directional bias. Bullish BOS on H4 = sequence of higher swing   |
-//| highs; bearish BOS = sequence of lower swing lows. When H4 bias  |
-//| agrees with the trade direction, use full lots. When it disagrees |
-//| (e.g., trade is long but H4 is bearish), reduce lots by 50% to   |
-//| acknowledge reduced probability, but do NOT skip entirely —       |
-//| M15 structure can diverge temporarily from H4.                    |
-//| Returns: 1.0 = aligned / 0.5 = disagreement.                     |
+//| GATE 7 — H4 BIAS (soft: lot multiplier only, no skip)            |
+//| ICT: H4 BOS confirms institutional directional commitment.       |
+//| Disagreement reduces lots to 50%, does NOT skip the trade.       |
+//| [FIX-17] Always returns multiplier — never sets g_setupConsumed. |
 //+------------------------------------------------------------------+
-double Gate7_HTFBias()
+double Gate7_HTFBias(bool isBullishSweep)
 {
    if(!InpEnableH4Filter) return 1.0;
 
-   bool h4Agrees = g_sweepBullish ? IsH4BullishBOS() : IsH4BearishBOS();
+   bool h4Agrees = isBullishSweep ? IsH4BullishBOS() : IsH4BearishBOS();
    if(!h4Agrees)
    {
-      Log("[G7] H4 disagrees — lot multiplier = 0.5");
+      g_statH4++;
+      Log("[G7] H4 disagrees — lots × 0.5");
       return 0.5;
    }
-   Log("[G7] H4 aligned — lot multiplier = 1.0");
+   Log("[G7] H4 aligned — lots × 1.0");
    return 1.0;
 }
 
 //+------------------------------------------------------------------+
 //| ATR REGIME FILTER                                                  |
-//| The EA fails outside its designed regime because fixed-pip logic  |
-//| breaks in low/high volatility. H4 ATR(14) measures the current   |
-//| regime: below 30p = consolidation (no trends to exploit, no       |
-//| meaningful Asian range sweeps); above 120p = extreme volatility   |
-//| (risk controlled by capping effective risk% to 0.25%).            |
+//| Below 30p H4 ATR = consolidation, no sweep opportunities.        |
+//| Above 120p = extreme vol, risk reduced to 0.25% by Gate6.        |
 //+------------------------------------------------------------------+
 bool CheckATRRegime()
 {
-   if(g_atrH4Handle == INVALID_HANDLE) return true;  // Pass-through if no handle
+   if(g_atrH4Handle == INVALID_HANDLE) return true;
 
    double atrBuf[1];
    if(CopyBuffer(g_atrH4Handle, 0, 1, 1, atrBuf) < 1) return true;
@@ -831,13 +991,13 @@ bool CheckATRRegime()
 
    if(atrPips < InpMinATRH4)
    {
+      g_statATRFilter++;
       Log("[REGIME] SKIP — H4 ATR=" + DoubleToString(atrPips, 1) + "p < min " +
-          DoubleToString(InpMinATRH4, 0) + "p. Low-vol regime.");
+          DoubleToString(InpMinATRH4, 0) + "p.");
       return false;
    }
    if(atrPips > InpMaxATRH4)
-      Log("[REGIME] H4 ATR=" + DoubleToString(atrPips, 1) + "p > max " +
-          DoubleToString(InpMaxATRH4, 0) + "p. Extreme regime — risk capped at 0.25%.");
+      Log("[REGIME] Extreme ATR=" + DoubleToString(atrPips, 1) + "p — risk capped 0.25%.");
 
    return true;
 }
@@ -863,7 +1023,6 @@ void ManagePendingOrders()
 
    if(!alive)
    {
-      // Filled or externally cancelled — transition handled in OnTradeTransaction
       Log("[PENDING] Ticket " + IntegerToString(g_pendingTicket) + " no longer pending.");
       g_pendingTicket = 0;
       return;
@@ -874,7 +1033,7 @@ void ManagePendingOrders()
    {
       if(g_trade.OrderDelete(g_pendingTicket))
       {
-         Log("[PENDING] EXPIRED after " + IntegerToString(g_pendingBars) + " bars — deleted.");
+         Log("[PENDING] EXPIRED after " + IntegerToString(g_pendingBars) + " bars.");
          g_pendingTicket = 0;
          g_state = STATE_IDLE;
       }
@@ -884,11 +1043,10 @@ void ManagePendingOrders()
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE OPEN POSITIONS — runs on EVERY tick                        |
-//| Handles:                                                           |
-//|  1. Max trade duration (force-close after InpMaxTradeDurationHours)|
-//|  2. TP1 partial close — close 50% at 1R and move SL to breakeven |
-//|  3. ATR trailing stop on remaining 50% after TP1 triggers        |
+//| MANAGE OPEN POSITIONS — every tick                                |
+//| 1. Max duration force-close                                       |
+//| 2. TP1 partial close (60%) at 1R → move SL to breakeven          |
+//| 3. ATR trailing stop on remaining 40% after TP1                  |
 //+------------------------------------------------------------------+
 void ManageOpenPositions()
 {
@@ -906,15 +1064,14 @@ void ManageOpenPositions()
       double bid   = SymbolInfoDouble(Symbol(), SYMBOL_BID);
       double ask   = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
 
-      // ── 1. MAX TRADE DURATION ─────────────────────────────────
+      // 1. Max trade duration
       if(g_tradeEntryTime > 0)
       {
          double hoursOpen = (double)(TimeCurrent() - g_tradeEntryTime) / 3600.0;
          if(hoursOpen >= (double)InpMaxTradeDurationHours)
          {
             g_trade.PositionClose(ticket);
-            Log("[MGMT] MAX DURATION (" + DoubleToString(hoursOpen, 1) +
-                "h) — force closed #" + IntegerToString(ticket));
+            Log("[MGMT] MAX DURATION (" + DoubleToString(hoursOpen, 1) + "h) — closed #" + IntegerToString(ticket));
             continue;
          }
       }
@@ -925,98 +1082,69 @@ void ManageOpenPositions()
       {
          double initialRisk = entry - sl;
          if(initialRisk <= 0.0) continue;
-         double tp1Price = entry + InpTP1Ratio * initialRisk;
+         double tp1Price = entry + InpTP1RR * initialRisk;
 
-         // ── 2a. TP1 PARTIAL CLOSE (50%) ───────────────────────
+         // TP1 partial close 60%
          if(!g_partialClosed && bid >= tp1Price)
          {
-            double halfLots = NormalizeDouble(lots * 0.5,
-                              (int)MathRound(-MathLog10(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP))));
-            double minLot   = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
             double lotStep  = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
-            halfLots        = MathMax(MathFloor(halfLots / lotStep) * lotStep, minLot);
+            double minLot   = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
+            double closeLot = MathMax(MathFloor(lots * 0.6 / lotStep) * lotStep, minLot);
 
-            if(halfLots < lots && g_trade.PositionClosePartial(ticket, halfLots))
+            if(closeLot < lots && g_trade.PositionClosePartial(ticket, closeLot))
             {
                g_partialClosed = true;
                double newSL = NormalizeDouble(entry + _Point, _Digits);
                g_trade.PositionModify(ticket, newSL, tp);
-               Log("[MGMT] TP1 PARTIAL BUY #" + IntegerToString(ticket) +
-                   " closed " + DoubleToString(halfLots, 2) + "L SL→BE=" +
-                   DoubleToString(newSL, _Digits));
+               Log("[MGMT] TP1(60%) BUY #" + IntegerToString(ticket) +
+                   " closed " + DoubleToString(closeLot, 2) + "L SL→BE");
             }
             continue;
          }
 
-         // ── 2b. BREAKEVEN (if no partial close yet) ───────────
-         if(!g_partialClosed && sl < entry && bid >= tp1Price)
-         {
-            double newSL = NormalizeDouble(entry + _Point, _Digits);
-            if(newSL > sl) g_trade.PositionModify(ticket, newSL, tp);
-         }
-
-         // ── 3. ATR TRAILING STOP (only after TP1 / BE) ────────
+         // ATR trailing after TP1
          if(g_partialClosed && sl >= entry)
          {
-            double trail = GetATRM15Trail();
-            if(trail > 0.0)
-            {
-               double trailSL = NormalizeDouble(bid - trail, _Digits);
-               if(trailSL > sl) g_trade.PositionModify(ticket, trailSL, tp);
-            }
+            double trail   = GetATRM15Trail();
+            double trailSL = NormalizeDouble(bid - trail, _Digits);
+            if(trail > 0.0 && trailSL > sl) g_trade.PositionModify(ticket, trailSL, tp);
          }
       }
       else if(g_pos.PositionType() == POSITION_TYPE_SELL)
       {
          double initialRisk = sl - entry;
          if(initialRisk <= 0.0) continue;
-         double tp1Price = entry - InpTP1Ratio * initialRisk;
+         double tp1Price = entry - InpTP1RR * initialRisk;
 
-         // ── 2a. TP1 PARTIAL CLOSE (50%) ───────────────────────
+         // TP1 partial close 60%
          if(!g_partialClosed && ask <= tp1Price)
          {
-            double halfLots = NormalizeDouble(lots * 0.5,
-                              (int)MathRound(-MathLog10(SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP))));
-            double minLot   = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
             double lotStep  = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_STEP);
-            halfLots        = MathMax(MathFloor(halfLots / lotStep) * lotStep, minLot);
+            double minLot   = SymbolInfoDouble(Symbol(), SYMBOL_VOLUME_MIN);
+            double closeLot = MathMax(MathFloor(lots * 0.6 / lotStep) * lotStep, minLot);
 
-            if(halfLots < lots && g_trade.PositionClosePartial(ticket, halfLots))
+            if(closeLot < lots && g_trade.PositionClosePartial(ticket, closeLot))
             {
                g_partialClosed = true;
                double newSL = NormalizeDouble(entry - _Point, _Digits);
                g_trade.PositionModify(ticket, newSL, tp);
-               Log("[MGMT] TP1 PARTIAL SELL #" + IntegerToString(ticket) +
-                   " closed " + DoubleToString(halfLots, 2) + "L SL→BE=" +
-                   DoubleToString(newSL, _Digits));
+               Log("[MGMT] TP1(60%) SELL #" + IntegerToString(ticket) +
+                   " closed " + DoubleToString(closeLot, 2) + "L SL→BE");
             }
             continue;
          }
 
-         // ── 2b. BREAKEVEN ─────────────────────────────────────
-         if(!g_partialClosed && (sl <= 0.0 || sl > entry) && ask <= tp1Price)
-         {
-            double newSL = NormalizeDouble(entry - _Point, _Digits);
-            if(sl <= 0.0 || newSL < sl) g_trade.PositionModify(ticket, newSL, tp);
-         }
-
-         // ── 3. ATR TRAILING STOP ──────────────────────────────
+         // ATR trailing after TP1
          if(g_partialClosed && sl > 0.0 && sl <= entry)
          {
-            double trail = GetATRM15Trail();
-            if(trail > 0.0)
-            {
-               double trailSL = NormalizeDouble(ask + trail, _Digits);
-               if(trailSL < sl) g_trade.PositionModify(ticket, trailSL, tp);
-            }
+            double trail   = GetATRM15Trail();
+            double trailSL = NormalizeDouble(ask + trail, _Digits);
+            if(trail > 0.0 && trailSL < sl) g_trade.PositionModify(ticket, trailSL, tp);
          }
       }
    }
 }
 
-//+------------------------------------------------------------------+
-//| GetATRM15Trail — half of M15 ATR(14) in price units              |
-//+------------------------------------------------------------------+
 double GetATRM15Trail()
 {
    if(g_atrM15Handle == INVALID_HANDLE) return 0.0;
@@ -1037,7 +1165,7 @@ void UpdateAsianRange()
 }
 
 //+------------------------------------------------------------------+
-//| DAILY RESET — fires at 00:00 GMT using TimeGMT()                 |
+//| DAILY RESET — fires at 00:00 GMT                                  |
 //+------------------------------------------------------------------+
 void CheckDailyReset(const MqlDateTime &gmt)
 {
@@ -1046,7 +1174,16 @@ void CheckDailyReset(const MqlDateTime &gmt)
    bool newDay = (gmt.year != prev.year || gmt.mon != prev.mon || gmt.day != prev.day);
    if(!newDay) return;
 
-   // Cancel any stale pending order from the previous day
+   // [FIX-21] Print gate stats from yesterday before reset
+   Log("[STATS] Sweeps=" + IntegerToString(g_statSweeps) +
+       " FVG=" + IntegerToString(g_statFVG) +
+       " Disp=" + IntegerToString(g_statDisplacement) +
+       " H4=" +   IntegerToString(g_statH4) +
+       " Asian=" + IntegerToString(g_statAsianFilter) +
+       " ATR=" +   IntegerToString(g_statATRFilter) +
+       " Orders=" + IntegerToString(g_statOrders));
+
+   // Cancel stale pending order
    if(g_pendingTicket != 0)
    {
       bool alive = false;
@@ -1055,43 +1192,60 @@ void CheckDailyReset(const MqlDateTime &gmt)
       if(alive) g_trade.OrderDelete(g_pendingTicket);
    }
 
-   g_asianHigh       = 0.0;
-   g_asianLow        = 0.0;
-   g_asianLocked     = false;
-   g_sweepBullish    = false;
-   g_sweepExtreme    = 0.0;
-   g_sweepTime       = 0;
-   g_fvgHigh         = 0.0;
-   g_fvgLow          = 0.0;
-   g_setupConsumed   = false;
-   g_tradedBuyToday  = false;
-   g_tradedSellToday = false;
-   g_pendingTicket   = 0;
-   g_pendingBars     = 0;
-   g_tradeEntryTime  = 0;
-   g_partialClosed   = false;
-   g_obState         = OB_NONE;
-   g_obHigh          = 0.0;
-   g_obLow           = 0.0;
-   g_obTime          = 0;
-   g_state           = STATE_IDLE;
+   // Reset all daily state
+   g_asianHigh          = 0.0;
+   g_asianLow           = 0.0;
+   g_asianLocked        = false;
+   g_londonHigh         = 0.0;
+   g_londonLow          = 0.0;
+   g_londonRangeSet     = false;
+   g_nyMorningHigh      = 0.0;
+   g_nyMorningLow       = 0.0;
+   g_nyMorningRangeSet  = false;
+   g_sweepBullish       = false;
+   g_sweepExtreme       = 0.0;
+   g_sweepTime          = 0;
+   g_sbSweepDetected    = false;
+   g_sbSweepBullish     = false;
+   g_sbSweepExtreme     = 0.0;
+   g_fvgHigh            = 0.0;
+   g_fvgLow             = 0.0;
+   g_londonConsumed     = false;
+   g_nyConsumed         = false;
+   g_sbConsumed         = false;
+   g_setupConsumed      = false;
+   g_tradedBuyToday     = false;
+   g_tradedSellToday    = false;
+   g_pendingTicket      = 0;
+   g_pendingBars        = 0;
+   g_tradeEntryTime     = 0;
+   g_partialClosed      = false;
+   g_obState            = OB_NONE;
+   g_obHigh             = 0.0;
+   g_obLow              = 0.0;
+   g_obTime             = 0;
+   g_state              = STATE_IDLE;
+   g_dailyHalt          = false;
+   g_dailyLossCount     = 0;
+   // Reset stat counters
+   g_statSweeps         = 0;
+   g_statFVG            = 0;
+   g_statDisplacement   = 0;
+   g_statH4             = 0;
+   g_statAsianFilter    = 0;
+   g_statATRFilter      = 0;
+   g_statOrders         = 0;
 
-   // Reset daily halt and per-day loss count (NOT g_consecutiveLosses — needs a WIN)
-   g_dailyHalt       = false;
-   g_dailyLossCount  = 0;
-
-   // Save today's starting equity for daily DD calculation
-   g_dayStartEquity  = AccountInfoDouble(ACCOUNT_EQUITY);
-   g_lastDayReset    = TimeGMT();
+   g_dayStartEquity     = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_lastDayReset       = TimeGMT();
 
    UpdateD1Equilibrium();
-
    Log("[RESET] DAY | DayEquity=" + DoubleToString(g_dayStartEquity, 2) +
-       " ConsecStreak=" + IntegerToString(g_consecutiveLosses));
+       " ConsecLoss=" + IntegerToString(g_consecutiveLosses));
 }
 
 //+------------------------------------------------------------------+
-//| WEEKLY RESET — fires Monday 00:00 GMT                             |
+//| WEEKLY RESET — Monday 00:00 GMT                                   |
 //+------------------------------------------------------------------+
 void CheckWeeklyReset(const MqlDateTime &gmt)
 {
@@ -1115,16 +1269,14 @@ bool IsWeeklyCapHit()
 }
 
 //+------------------------------------------------------------------+
-//| LOT SIZE CALCULATION                                               |
-//| Handles JPY pairs and non-standard tick sizes correctly.          |
-//| lots = riskAmount / ((slPriceDistance / tickSize) * tickValue)   |
+//| LOT SIZE — handles JPY pairs via tick size/value                  |
 //+------------------------------------------------------------------+
 double CalculateLotSize(double slPriceDistance, double riskAmount)
 {
    if(g_pipSize <= 0.0 || slPriceDistance <= 0.0 || riskAmount <= 0.0) return 0.0;
 
-   double tickValue = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE);
-   double tickSize  = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
+   double tickValue  = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE);
+   double tickSize   = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_SIZE);
    if(tickValue <= 0.0 || tickSize <= 0.0) return 0.0;
 
    double lossPerLot = (slPriceDistance / tickSize) * tickValue;
@@ -1147,7 +1299,7 @@ double CalculateLotSize(double slPriceDistance, double riskAmount)
 }
 
 //+------------------------------------------------------------------+
-//| CLOSE ALL ORDERS & POSITIONS (PropFirm kill switch utility)       |
+//| CLOSE ALL (PropFirm kill switch utilities)                        |
 //+------------------------------------------------------------------+
 void CloseAllOrders()
 {
@@ -1189,7 +1341,7 @@ int CountOpenPositions()
 }
 
 //+------------------------------------------------------------------+
-//| OnTradeTransaction — state transitions, win/loss tracking        |
+//| OnTradeTransaction                                                 |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest     &request,
@@ -1198,14 +1350,12 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
 
    ulong dealTicket = trans.deal;
-   // HistorySelect() MUST precede HistoryDealSelect() per MQL5 docs
    HistorySelect(TimeCurrent() - 86400 * 2, TimeCurrent() + 60);
    if(!HistoryDealSelect(dealTicket)) return;
    if((long)HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != InpMagicNumber) return;
 
    ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
 
-   // Entry deal: record time and mark direction traded today
    if(dealEntry == DEAL_ENTRY_IN)
    {
       g_tradeEntryTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
@@ -1229,16 +1379,15 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
       g_dailyLossCount++;
       Log("[TXN] LOSS P&L=" + DoubleToString(profit, 2) +
           " | Streak=" + IntegerToString(g_consecutiveLosses) +
-          " | DailyCount=" + IntegerToString(g_dailyLossCount));
+          " | DayCount=" + IntegerToString(g_dailyLossCount));
    }
    else
    {
       Log("[TXN] WIN P&L=+" + DoubleToString(profit, 2) +
           " | Reset streak from " + IntegerToString(g_consecutiveLosses));
-      g_consecutiveLosses = 0; // Streak only resets on a WIN
+      g_consecutiveLosses = 0;
    }
 
-   // If all positions closed, return to IDLE
    if(CountOpenPositions() == 0 && g_pendingTicket == 0)
    {
       g_state          = STATE_IDLE;
@@ -1248,9 +1397,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 }
 
 //+------------------------------------------------------------------+
-//| H4 STRUCTURE — BREAK OF STRUCTURE DETECTION                      |
-//| Bullish BOS: two swing highs where most-recent > prior (HH)      |
-//| Bearish BOS: two swing lows where most-recent < prior (LL)       |
+//| H4 BOS DETECTION                                                   |
 //+------------------------------------------------------------------+
 bool IsH4BullishBOS()
 {
@@ -1283,7 +1430,7 @@ bool IsH4BearishBOS()
 }
 
 //+------------------------------------------------------------------+
-//| ORDER BLOCK DETECTION (optional — InpEnableOBFilter)              |
+//| ORDER BLOCK DETECTION                                              |
 //+------------------------------------------------------------------+
 void DetectOrderBlock()
 {
@@ -1306,33 +1453,28 @@ void DetectOrderBlock()
    }
 
    int lookback = (int)MathMin((double)InpH4LookbackBars, (double)(Bars(Symbol(), PERIOD_H4) - 5));
+   bool isBullishSweep = g_sbSweepDetected ? g_sbSweepBullish : g_sweepBullish;
    for(int i = 2; i < lookback; i++)
    {
       double o = iOpen(Symbol(), PERIOD_H4, i);
       double c = iClose(Symbol(), PERIOD_H4, i);
-      if(g_sweepBullish && c < o)  // Bearish H4 candle = bullish OB
+      if(isBullishSweep && c < o)
       {
-         g_obHigh = iHigh(Symbol(), PERIOD_H4, i); g_obLow = iLow(Symbol(), PERIOD_H4, i);
-         g_obBullish=true; g_obState=OB_UNTESTED; g_obTime=iTime(Symbol(), PERIOD_H4, i);
-         Log("[OB] Bullish OB bar[" + IntegerToString(i) + "] " +
-             DoubleToString(g_obLow,_Digits) + "-" + DoubleToString(g_obHigh,_Digits));
-         break;
+         g_obHigh=iHigh(Symbol(),PERIOD_H4,i); g_obLow=iLow(Symbol(),PERIOD_H4,i);
+         g_obBullish=true; g_obState=OB_UNTESTED; g_obTime=iTime(Symbol(),PERIOD_H4,i);
+         Log("[OB] Bullish bar[" + IntegerToString(i) + "]"); break;
       }
-      if(!g_sweepBullish && c > o)  // Bullish H4 candle = bearish OB
+      if(!isBullishSweep && c > o)
       {
-         g_obHigh = iHigh(Symbol(), PERIOD_H4, i); g_obLow = iLow(Symbol(), PERIOD_H4, i);
-         g_obBullish=false; g_obState=OB_UNTESTED; g_obTime=iTime(Symbol(), PERIOD_H4, i);
-         Log("[OB] Bearish OB bar[" + IntegerToString(i) + "] " +
-             DoubleToString(g_obLow,_Digits) + "-" + DoubleToString(g_obHigh,_Digits));
-         break;
+         g_obHigh=iHigh(Symbol(),PERIOD_H4,i); g_obLow=iLow(Symbol(),PERIOD_H4,i);
+         g_obBullish=false; g_obState=OB_UNTESTED; g_obTime=iTime(Symbol(),PERIOD_H4,i);
+         Log("[OB] Bearish bar[" + IntegerToString(i) + "]"); break;
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| NEWS FILTER — MT5 calendar API with hardcoded fallback            |
-//| Backtester: calendar API returns empty arrays — hardcoded         |
-//| schedule activates automatically to block NFP/FOMC windows.      |
+//| NEWS FILTER — MT5 calendar API + hardcoded fallback               |
 //+------------------------------------------------------------------+
 bool IsNewsTime(datetime gmtTime)
 {
@@ -1348,12 +1490,12 @@ bool IsNewsTime(datetime gmtTime)
       {
          MqlCalendarEvent ev;
          if(!CalendarEventById(vals[i].event_id, ev)) continue;
-         if(ev.importance != CALENDAR_IMPORTANCE_HIGH)  continue;
+         if(ev.importance != CALENDAR_IMPORTANCE_HIGH) continue;
          datetime evT = vals[i].time;
          if(gmtTime >= evT - (datetime)(InpNewsHaltMinutes * 60) &&
             gmtTime <= evT + (datetime)(InpNewsHaltMinutes * 60))
          {
-            Log("[NEWS] " + curs[j] + " high-impact event @ " + TimeToString(evT));
+            Log("[NEWS] " + curs[j] + " high-impact @ " + TimeToString(evT));
             return true;
          }
       }
@@ -1365,9 +1507,7 @@ bool IsHardcodedNewsTime(datetime gmtTime)
 {
    MqlDateTime dt;
    TimeToStruct(gmtTime, dt);
-   // NFP: first Friday of month, ~13:30 GMT
    if(dt.day_of_week == 5 && dt.day <= 7 && dt.hour == 13) return true;
-   // FOMC: select Wednesdays, ~19:00-20:00 GMT
    int fomcMonths[] = {1,3,5,6,7,9,11,12};
    if(dt.day_of_week == 3)
       for(int i = 0; i < ArraySize(fomcMonths); i++)
@@ -1377,7 +1517,7 @@ bool IsHardcodedNewsTime(datetime gmtTime)
 }
 
 //+------------------------------------------------------------------+
-//| D1 EQUILIBRIUM / WEEKLY BIAS / TREND ALIGNMENT                    |
+//| D1 / WEEKLY / TREND HELPERS                                       |
 //+------------------------------------------------------------------+
 void UpdateD1Equilibrium()
 {
