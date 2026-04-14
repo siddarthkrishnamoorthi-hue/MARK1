@@ -754,7 +754,8 @@ void Gate6_PlaceLimitOrder(double lotsMultiplier = 1.0)
                ? NormalizeDouble(entryPrice + InpTP2Ratio * risk, _Digits)
                : NormalizeDouble(entryPrice - InpTP2Ratio * risk, _Digits);
 
-   if(!IsTradeAllowed()) { Log("[G6] Trade not allowed by terminal settings."); return; }
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ||
+   !AccountInfoInteger(ACCOUNT_TRADE_ALLOWED)) { Log("[G6] Trade not allowed by terminal settings."); return; }
 
    bool result = (orderType == ORDER_TYPE_BUY_LIMIT)
       ? g_trade.BuyLimit( totalLots, entryPrice, Symbol(), slPrice, tp2, 0, 0, "MARK1-OTE")
