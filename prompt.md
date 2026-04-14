@@ -1,178 +1,201 @@
-You are an expert MQL5 developer and institutional-grade forex EA architect. 
-I am providing you with my complete MARK1.mq5 EA code. Your task is a deep, 
-systematic refactor to make it robust, prop-firm compliant, and profitable 
-across any date range and market regime.
+You are a senior MQL5 architect. I am attaching my complete ICT_LondonSweep_FVG.mq5 
+EA (MARK1 project). It compiles clean but produces terrible backtest results:
+19 trades, PF 0.25, Win Rate 15.79%, Max DD 3.93%.
 
-=== CONTEXT ===
-Strategy: ICT methodology — Asian Range definition → London Judas Swing 
-(liquidity sweep) → Fair Value Gap entry → M15 EURUSD
-Goal: Pass FTMO Standard Challenge and trade funded account
-Problem: EA worked in early 2023 but performance degrades over time, 
-win rate too low (~23%), max DD too high (~37%), only 26 trades/15 months
+The DD is acceptable but the win rate and PF are broken. I need you to fix 
+specific diagnosed bugs and refactor the entry quality logic. Do NOT change 
+the overall ICT strategy concept. Work with the existing code structure.
 
-=== PROP FIRM HARD RULES (embed as kill switches in code) ===
-- Max Daily Loss: 4.0% of starting day equity (FTMO limit is 5% — stay 1% inside)
-- Max Total Drawdown: 8.0% of initial balance (FTMO limit is 10% — stay 2% inside)
-- Daily loss is calculated on FLOATING equity (open trades count) — check every tick
-- If either limit is hit → close ALL trades + block new trades for rest of day
-- Weekly drawdown soft cap: 3.5% — reduce lot size to 50% for remainder of week
-- No trades on Friday after 20:00 GMT (weekend gap risk)
-- No trades during news (high-impact, ±30 min window)
-- Max 1 trade per day per direction
+==============================================================
+PART 1 — FIX THESE SPECIFIC BUGS (in order of impact)
+==============================================================
 
-=== ENTRY LOGIC — REBUILD IN THIS EXACT ORDER (all must pass) ===
+BUG-1: FVG SCAN IS HARDCODED TO BARS 1 AND 3 ONLY
+  Location: ScanForFVGAndEnter()
+  Problem: Variables high1/low1 and high3/low3 only check one fixed 3-bar window.
+           InpFVGScanBars input exists but is completely unused in this function.
+  Fix: Loop from i=1 to InpFVGScanBars, checking each 3-bar combination [i, i+1, i+2].
+       Use the FIRST (most recent) valid FVG found that matches sweep direction.
+       Minimum FVG size: (fvgHigh - fvgLow) >= InpMinFVGPips * g_pipSize
+       If no FVG found in the scan window, log "No FVG in scan window" and return 
+       without setting g_setupConsumed = true (allow retry next bar).
 
-GATE 1 — SESSION FILTER
-  Valid sessions: London Kill Zone 07:00–10:00 GMT, NY Kill Zone 13:00–16:00 GMT
-  Silver Bullet bonus window: 10:00–11:00 GMT (London close)
-  Outside these windows → no new trades
+BUG-2: g_setupConsumed = true FIRES ON FILTER REJECTION — KILLS THE WHOLE DAY
+  Location: PlaceLimitOrder() — every early return from filters sets g_setupConsumed=true
+  Problem: If H4 filter rejects a London trade, g_setupConsumed=true blocks the 
+           Silver Bullet and NY session for the rest of the day.
+  Fix: g_setupConsumed should ONLY be set to true when:
+       (a) An order was successfully placed, OR
+       (b) The FVG was found but the price geometry was invalid (entry >= ask, etc.)
+       Filter rejections (H4, WeeklyBias, PD, OB) must NOT set g_setupConsumed=true.
+       Instead, return silently — allow the next session window to retry.
+       Add a new bool g_londonSetupConsumed and g_nySetupConsumed for per-session tracking.
 
-GATE 2 — ASIAN RANGE LOCK
-  Asian session: 00:00–07:00 GMT (your current InpAsianStart/End)
-  Lock the high and low at 07:00 GMT exactly
-  Require Asian range to be between 8–40 pips (filter dead/explosive days)
-  If range < 8 pips → skip day (range too compressed, no sweep opportunity)
-  If range > 40 pips → skip day (already too volatile, sweep likely done)
+BUG-3: NY KILL ZONE USES STALE ASIAN RANGE FOR SWEEP DETECTION
+  Location: OnTick() — DetectJudasSwing() called for both London AND NY
+  Problem: At 13:00 GMT, the Asian range is 13 hours old. Any "sweep" detected 
+           against it is meaningless.
+  Fix: For NY session, detect sweeps of the LONDON SESSION RANGE (08:00-12:00 GMT 
+       high and low), not the Asian range.
+       Add new globals: g_londonHigh, g_londonLow, g_londonRangeSet
+       Capture London range high/low during 08:00-12:00 GMT (after Asian range locks)
+       In NY sweep detection, use g_londonHigh and g_londonLow as the reference levels.
+       Separate the sweep function: DetectLondonJudasSwing() and DetectNYSweep()
 
-GATE 3 — LIQUIDITY SWEEP CONFIRMATION (CRITICAL — add this, it's missing)
-  For LONG setup: 
-    Price must wick BELOW asian_low by at least 2 pips
-    AND the M15 candle must CLOSE BACK ABOVE asian_low
-    This confirms the stop hunt / Judas sweep happened
-  For SHORT setup:
-    Price must wick ABOVE asian_high by at least 2 pips  
-    AND the M15 candle must CLOSE BACK BELOW asian_high
-  Without this confirmation → NO ENTRY. This is the single biggest fix.
+BUG-4: SILVER BULLET HAS NO INDEPENDENT ENTRY STATE
+  Location: OnTick(), ScanForFVGAndEnter()
+  Problem: Silver Bullet (15:00-16:00 GMT) reuses g_sweepDetected from London session.
+           If London ran and was consumed, Silver Bullet never fires.
+           If London was rejected by filters, Silver Bullet uses a stale 7-hour-old sweep.
+  Fix: Silver Bullet is an independent model. It needs:
+       - Its own sweep state: g_sbSweepDetected, g_sbSweepBullish, g_sbSweepExtreme
+       - Sweep reference: NY morning range (13:00-15:00 GMT high/low)
+       - Its own FVG scan and entry placement
+       - Its own g_sbSetupConsumed flag
+       Add: g_nyMorningHigh, g_nyMorningLow captured during 13:00-15:00 GMT
+       Silver Bullet sweep: wick beyond g_nyMorningHigh/Low + close back inside
+       Silver Bullet SL: use g_sbSweepExtreme ± InpSilverBulletSLPips (keep existing input)
 
-GATE 4 — DISPLACEMENT CANDLE
-  After the sweep candle, the NEXT candle must show displacement:
-  Body size ≥ 60% of full candle range
-  Body size in pips ≥ 6 pips
-  Direction must OPPOSE the sweep (sweep down → displacement up = bullish)
-  Both conditions must be true simultaneously
+BUG-5: SL PLACEMENT IS INCONSISTENT
+  Location: PlaceLimitOrder()
+  Current: slPrice = g_sweepExtreme - slDistance (fixed pip offset from wick tip)
+  Problem: Makes SL distance random — depends on how far the wick extended.
+           On some days SL is 15 pips, others 40 pips, making lot sizing erratic.
+  Fix: Use the Asian range itself to set a consistent SL:
+       asian_range_pips = (g_asianHigh - g_asianLow) / g_pipSize
+       For LONG: slPrice = g_asianLow - (0.2 * asian_range_pips * g_pipSize)
+       For SHORT: slPrice = g_asianHigh + (0.2 * asian_range_pips * g_pipSize)
+       Then: sl_pips = MathAbs(entryPrice - slPrice) / g_pipSize
+       Clamp: if sl_pips < 12 → set sl_pips = 12; if sl_pips > 45 → set sl_pips = 45
+       This gives a consistent, structure-based SL every day.
 
-GATE 5 — FVG DETECTION
-  Scan the last InpFVGScanBars (default 5) candles after displacement
-  Bullish FVG: candle[i].low > candle[i+2].high (gap between candle 0 top and candle 2 bottom)
-  Bearish FVG: candle[i].high < candle[i+2].low
-  FVG must be ≥ InpMinFVGPips (default 3 pips) wide
-  Only use the MOST RECENT valid FVG
+==============================================================
+PART 2 — ENTRY QUALITY IMPROVEMENTS (add these)
+==============================================================
 
-GATE 6 — OTE ENTRY (fix: change from 25% to 50% of FVG)
-  Entry price = fvg_low + (fvg_high - fvg_low) * 0.50  // for longs
-  Entry price = fvg_high - (fvg_high - fvg_low) * 0.50  // for shorts
-  Use pending limit order (not market order) so entry only triggers at OTE
-  Order expires after InpOrderExpiryBars bars if not filled
+IMPROVEMENT-1: TIERED TAKE PROFIT (replace single 3RR TP)
+  Current: Single TP at 3RR — almost never hit, explains low win rate.
+  Replace with:
+    TP1 = entry ± (1.0 * risk_distance) → close 60% of position, move SL to breakeven
+    TP2 = entry ± (2.0 * risk_distance) → close remaining 40%
+  This gives "wins" at 1RR which a 3RR target never produces.
+  Implementation: Place order with TP at 2RR. After TP1 level is hit 
+  (check in OnTick via position profit >= 1R), close 60% and modify SL to breakeven.
+  Add globals: g_tp1Hit = false, g_positionTicket for tracking.
+  Add function: ManageOpenPosition() called every tick when a position is open.
 
-GATE 7 — HTF BIAS CONFIRMATION (enable this — was falsely disabled)
-  H4 timeframe: Check if last 3 H4 candles show BOS in trade direction
-  BOS for long = H4 made a higher low recently
-  BOS for short = H4 made a lower high recently
-  If H4 disagrees with trade direction → reduce lot size to 50%, don't skip entirely
+IMPROVEMENT-2: ASIAN RANGE SIZE FILTER
+  Before any trade, validate the Asian range is tradeable:
+  asian_range_pips = (g_asianHigh - g_asianLow) / g_pipSize
+  If asian_range_pips < 8 → Log("Asian range too small, skip day") and set 
+    g_londonSetupConsumed = true (skip London) but NOT NY/Silver Bullet
+  If asian_range_pips > 50 → Log("Asian range too large, skip day — already volatile")
+    and block ALL sessions for the day.
+  This single filter eliminates the worst trading days.
 
-=== STOP LOSS — REPLACE FIXED PIPS WITH DYNAMIC ===
-  asian_range = asian_high - asian_low
-  sl_distance = asian_range * 1.1 (10% beyond the swept extreme)
-  Minimum SL: 15 pips, Maximum SL: 50 pips
-  Place SL at: asian_low - sl_distance (for longs)
-                asian_high + sl_distance (for shorts)
-  This adapts to each day's actual market structure automatically
+IMPROVEMENT-3: DISPLACEMENT CONFIRMATION BEFORE FVG SCAN
+  Before calling ScanForFVGAndEnter(), require a displacement candle:
+  bool HasDisplacementCandle():
+    Check bar[1] (the bar right after the sweep candle)
+    body = MathAbs(iClose - iOpen) of bar[1]
+    range = iHigh - iLow of bar[1]  
+    body_pct = (body / range) * 100 if range > 0 else 0
+    body_pips = body / g_pipSize
+    Return: body_pct >= InpMinDisplacementBodyPct AND body_pips >= InpMinDisplacementPips
+             AND direction matches sweep (bullish sweep → bar[1] is bullish close > open)
+  Only call ScanForFVGAndEnter() if HasDisplacementCandle() returns true.
 
-=== TAKE PROFIT — TIERED EXITS (replace single TP) ===
-  TP1: 1.0 × risk (50% of position) → close and move SL to breakeven
-  TP2: 2.0 × risk (remaining 50%) → final close
-  This secures profit early and lets remainder run
-  Do NOT use a 3RR single TP — too few winners reach it
-
-=== RISK MANAGEMENT RULES ===
-  Base risk per trade: 0.5% of current equity
-  After 2 consecutive losses → reduce to 0.25% until 1 win
-  After 4 consecutive losses → stop trading for the day
-  After hitting weekly soft cap (3.5% DD) → trade at 0.25% rest of week
-  Lot size formula: lots = (equity * risk_pct) / (sl_pips * pip_value)
-  Always recalculate lots fresh per trade, never cache it
-
-=== REGIME FILTER — MAKES IT WORK ACROSS ANY DATE RANGE ===
-  Add ATR-based regime detection on H4:
-  atr_14 = iATR(Symbol(), PERIOD_H4, 14)
-  If atr_14 < 30 pips → low volatility regime → skip day (market not moving)
-  If atr_14 > 120 pips → extreme regime → reduce risk to 0.25%
-  Normal regime (30-120 pips ATR) → trade normally
-  This is WHY the EA fails in different periods — regime changes break fixed-pip logic
-
-=== TRADE MANAGEMENT (add these) ===
-  Breakeven: Move SL to entry + 1 pip after TP1 hits
-  Trailing stop: After TP1, trail SL by 50% of ATR on M15
-  Max trade duration: 8 hours — close any open trade at session end regardless of PnL
-  No overnight holds (FTMO standard account restriction)
-
-=== CODE QUALITY REQUIREMENTS ===
-  1. Every gate must be a separate bool function: 
-     bool Gate1_SessionFilter(), Gate2_AsianRange(), Gate3_SweepConfirmed(), etc.
-  2. All gates logged to file when InpEnableDebug=true
-  3. Enum for trade state machine: IDLE, AWAITING_SWEEP, AWAITING_FVG, PENDING_ENTRY, IN_TRADE
-  4. No magic numbers in code — all values must reference named constants or input params
-  5. HistorySelect() before every HistoryDealSelect() call
-  6. Check IsTradeAllowed() before every OrderSend()
-  7. Daily reset at 00:00 GMT sharp (not broker time) using TimeGMT()
-  8. g_setupConsumed reset only after kill zone ends (preserve your BUG-2 fix)
-  9. PropFirm safety check runs on EVERY tick, not just on bar open
-  10. All monetary calculations in account currency, handle JPY pairs correctly
-
-=== INPUTS TO EXPOSE ===
-  // Risk
-  InpRiskPercent = 0.5
-  InpMaxDailyLossPct = 4.0
-  InpMaxTotalDDPct = 8.0
-  InpWeeklyDDSoftCapPct = 3.5
+IMPROVEMENT-4: PROP FIRM DAILY EQUITY GUARD (runs every tick)
+  Add at the TOP of OnTick() before any other logic:
   
-  // Structure
-  InpAsianStartGMT = 0
-  InpAsianEndGMT = 7
-  InpMinAsianRangePips = 8
-  InpMaxAsianRangePips = 40
-  InpSweepConfirmPips = 2
+  double startDayEquity — recorded at midnight GMT each day (in ResetDailyState)
+  double startBalance — recorded at OnInit() and updated after TP2 hits
   
-  // Entry
-  InpFVGScanBars = 5
-  InpMinFVGPips = 3
-  InpOTEPercent = 50  // 50% of FVG = OTE
-  InpOrderExpiryBars = 3
-  InpMinDisplacementBodyPct = 60
-  InpMinDisplacementPips = 6
+  Every tick, check:
+    currentEquity = AccountInfoDouble(ACCOUNT_EQUITY)
+    dailyLoss = (startDayEquity - currentEquity) / startDayEquity * 100
+    totalDD = (startBalance - currentEquity) / startBalance * 100
+    
+    if dailyLoss >= InpMaxDailyLossPct (default 4.0):
+      Close all positions (loop PositionsTotal, call trade.PositionClose)
+      Delete all pending orders
+      Set g_tradingHaltedToday = true
+      Log("DAILY LOSS LIMIT HIT — trading halted")
+      return
+    
+    if totalDD >= InpMaxTotalDDPct (default 8.0):
+      Close all positions
+      Set g_tradingHaltedPermanent = true
+      Log("MAX DRAWDOWN LIMIT HIT — EA disabled")
+      return
+    
+    if g_tradingHaltedToday or g_tradingHaltedPermanent: return
   
-  // Exit
-  InpTP1Ratio = 1.0
-  InpTP2Ratio = 2.0
-  InpMaxTradeDurationHours = 8
+  Add inputs:
+    InpMaxDailyLossPct = 4.0   // Hard stop: 4% daily (FTMO limit is 5%)
+    InpMaxTotalDDPct = 8.0     // Hard stop: 8% total (FTMO limit is 10%)
   
-  // Filters
-  InpEnableH4Filter = true
-  InpMinATRH4 = 30
-  InpMaxATRH4 = 120
-  InpNewsHaltMinutes = 30
-  InpEnableDebug = true
+  Reset g_tradingHaltedToday = false in ResetDailyState() each morning.
 
-=== BACKTEST VALIDATION TARGETS ===
-  After refactor, backtest on EURUSD M15, Every Tick, 2023-01-02 to 2023-06-08
-  Minimum pass criteria:
-  - Trade count: 60–150
-  - Profit Factor: ≥ 1.5
-  - Win Rate: ≥ 30%
-  - Max Drawdown: ≤ 8%
-  - Consecutive losses: ≤ 5
-  
-  If not met, report which gate is filtering too many or too few trades by checking
-  the debug log counts per gate.
+IMPROVEMENT-5: ATR REGIME FILTER
+  In OnTick(), after Asian range locks at London open:
+  Add function bool IsGoodVolatilityRegime():
+    atrHandle = iATR(Symbol(), PERIOD_H4, 14)
+    Get ATR value into array, check atrValue[0]
+    atr_pips = atrValue[0] / g_pipSize
+    if atr_pips < 20 → return false (dead market)
+    if atr_pips > 150 → return false (extreme/news spike)
+    return true
+  If !IsGoodVolatilityRegime() → skip day (log reason), return from OnTick.
+  This makes the EA regime-adaptive across any date range.
 
-=== WHAT TO DELIVER ===
-  1. Complete refactored MARK1.mq5 — compiles with zero errors/warnings
-  2. Brief comment above each gate function explaining the ICT concept it implements
-  3. A summary of every logical change made vs the current code
-  4. Flag any remaining risks or edge cases I should test manually
+==============================================================
+PART 3 — INPUT PARAMETERS TO ADD
+==============================================================
+  input double InpMaxDailyLossPct = 4.0;    // Prop firm daily loss guard (%)
+  input double InpMaxTotalDDPct = 8.0;      // Prop firm total drawdown guard (%)
+  input double InpMinAsianRangePips = 8.0;  // Skip days with tiny Asian range
+  input double InpMaxAsianRangePips = 50.0; // Skip days with huge Asian range  
+  input double InpTP1RR = 1.0;              // First TP at 1R (close 60%)
+  input double InpTP2RR = 2.0;              // Second TP at 2R (close 40%)
+  input int    InpMinDisplacementBodyPct = 60; // Min displacement body %
+  input int    InpMinDisplacementPips = 6;     // Min displacement body pips
+  input int    InpFVGScanBars = 5;          // Bars to scan for FVG (was unused)
+  input double InpMinFVGPips = 3.0;         // Minimum FVG gap size in pips
+  input double InpMinATRH4Pips = 20.0;      // Min H4 ATR for regime filter
+  input double InpMaxATRH4Pips = 150.0;     // Max H4 ATR for regime filter
 
-Now read my attached MARK1.mq5 code and perform this full refactor.
+==============================================================
+PART 4 — DO NOT CHANGE
+==============================================================
+  - FIX-01 through FIX-16 already in the code (keep all of them)
+  - ORDER_FILLING_RETURN (FIX-15) — keep
+  - CalendarValueHistory news filter with hardcoded fallback — keep  
+  - H4 BOS functions IsH4BullishBOS() / IsH4BearishBOS() — keep as is
+  - GMT offset calculation — keep
+  - Magic number tracking — keep
+  - Order expiry logic (InpOrderExpiryBars) — keep
 
-Key Reasons Why Your EA Was Declining
-Root CauseFix in PromptNo sweep confirmation gateGate 3 — mandatory wick+close checkFixed 30-pip SL ignores market structureDynamic SL = Asian range × 1.125% FVG entry → bad fill rateGate 6 → 50% OTE entryNo regime detection → breaks in low/high volATR H4 regime filterSingle 3RR TP → almost never hitTiered TP1 at 1R + TP2 at 2RDD checks only on bar openPropFirm check every tick (open equity counts)H4 filter disabledRe-enabled, softened to lot reduction not skipRisk not reducing after lossesDrawdown-adaptive lot sizing
-The ATR regime filter and sweep confirmation gate are the two changes that will most directly fix the "works early, degrades later" problem — because they make the EA skip days where the strategy structurally doesn't apply, rather than forcing entries in wrong conditions.
+==============================================================
+PART 5 — VALIDATION TARGETS AFTER REFACTOR
+==============================================================
+  Backtest: EURUSD M15, Every Tick, 2023-01-02 to 2023-06-08
+  Pass criteria:
+  - Trades: 50-120
+  - Profit Factor: >= 1.4
+  - Win Rate: >= 32% (tiered TP makes this achievable)
+  - Max Drawdown: <= 6%
+  - Max Consecutive Losses: <= 5
+
+  If win rate is below 32% after changes, report which gate is 
+  filtering the most setups by adding a counter to each gate and 
+  printing a daily summary: 
+  "Gate stats: Sweep=X FVG=X Displacement=X H4=X Asian=X ATR=X Orders=X"
+
+==============================================================
+DELIVER:
+==============================================================
+  1. Complete refactored ICT_LondonSweep_FVG.mq5 — zero compile errors
+  2. Comment each change with // [MARK1-FIX-XX] tag
+  3. List of every change made with before/after summary
+  4. Any remaining risks to test manually
