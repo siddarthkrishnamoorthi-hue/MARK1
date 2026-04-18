@@ -1,174 +1,144 @@
-You are fixing a MetaTrader 5 Expert Advisor (EA) that currently has PF 0.68, 6% long win rate, 39% drawdown.
+File: ICT_LondonSweep_FVG_v3_backup.mq5
 
-FILE: ICT_LondonSweep_FVG_v3_backup.mq5 (in workspace root)
+CRITICAL DIAGNOSIS: EA filters valid setups but enters at wrong price levels, causing 75-87% of trades to hit SL. The 25% entry point is being rejected by market structure.
 
-CRITICAL FIXES REQUIRED:
+CORE FIX - DYNAMIC FVG ENTRY:
 
-1. PARAMETER CHANGES (update input declarations):
-   - InpOrderExpiryBars = 40 (was 10) — FVG retracements need more time
-   - InpMinDisplacementBodyPct = 75 (was 60) — stronger impulse requirement
-   - InpMinDisplacementPips = 10 (was 6) — filter out noise on EURUSD
-   - InpMinFVGPips = 6 (was 3) — reject tiny FVGs
-   - InpEnableTrendFilter = true (was false) — CRITICAL: gate to D1 EMA200 direction
-
-2. FVG ENTRY LOGIC VERIFICATION:
-   In ScanForFVGAndEnter() function around line 460-520:
+1. REPLACE STATIC 25% ENTRY with MARKET-ADAPTIVE:
    
-   a) Verify bullish FVG entry calculation:
-      - Should be: g_fvgMid = g_fvgHigh - (g_fvgHigh - g_fvgLow) * 0.25
-      - Entry at 25% from HIGH (not midpoint)
+   In ScanForFVGAndEnter(), change FVG entry logic:
    
-   b) Verify bearish FVG entry calculation:
-      - Should be: g_fvgMid = g_fvgLow + (g_fvgHigh - g_fvgLow) * 0.25
-      - Entry at 25% from LOW (not midpoint)
+```mql5
+   // OLD (delete):
+   // g_fvgMid = g_fvgHigh - fvgRange * 0.25;  // Bullish
+   // g_fvgMid = g_fvgLow + fvgRange * 0.25;   // Bearish
    
-   c) Confirm displacement check uses bar[offset+1] (the impulse candle)
+   // NEW (adaptive entry based on FVG size):
+   double entryDepth = 0.5; // Start at 50% (midpoint)
+   
+   // If FVG is large (>8 pips), can afford deeper entry
+   if(fvgRange > 8.0 * g_pipSize)
+       entryDepth = 0.382; // 38.2% Fibonacci retracement
+   
+   // If FVG is small (3-5 pips), stay shallow to avoid missing fill
+   else if(fvgRange < 5.0 * g_pipSize)
+       entryDepth = 0.618; // 61.8% into the zone
+   
+   if(g_sweepBullish)
+       g_fvgMid = g_fvgHigh - fvgRange * entryDepth;
+   else
+       g_fvgMid = g_fvgLow + fvgRange * entryDepth;
+```
 
-3. ADD ADAPTIVE STOP LOSS MECHANISM:
+2. ADD IMMEDIATE ENTRY FALLBACK:
+   
+   After limit order placement, check if price already in FVG:
+   
+```mql5
+   // In PlaceLimitOrder(), after calculating entryPrice, ADD:
+   
+   double currentPrice = (g_sweepBullish ? 
+       SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+       SymbolInfoDouble(_Symbol, SYMBOL_BID));
+   
+   // If price already swept through FVG zone, enter at market
+   bool priceInZone = false;
+   if(g_sweepBullish)
+       priceInZone = (currentPrice >= g_fvgLow && currentPrice <= entryPrice);
+   else
+       priceInZone = (currentPrice <= g_fvgHigh && currentPrice >= entryPrice);
+   
+   if(priceInZone)
+   {
+       // Use MARKET order instead of LIMIT
+       orderType = g_sweepBullish ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+       entryPrice = currentPrice;
+       
+       // Place market order immediately
+       result = g_sweepBullish ?
+           g_trade.Buy(lotSize, _Symbol, 0, slPrice, tpPrice, "ICT-FVG Market Buy") :
+           g_trade.Sell(lotSize, _Symbol, 0, slPrice, tpPrice, "ICT-FVG Market Sell");
+       
+       Log("MARKET ENTRY: Price already in FVG zone");
+       return;
+   }
+```
+
+3. RELAX DISPLACEMENT FILTER (currently rejecting valid impulse):
+   
+   Change inputs:
+```mql5
+   input int InpMinDisplacementBodyPct = 65; // Was 75, too strict
+   input int InpMinDisplacementPips = 8;     // Was 10, missing smaller valid moves
+```
+
+4. EXTEND ORDER LIFETIME (price needs more time to retrace):
+   
+```mql5
+   input int InpOrderExpiryBars = 60; // Was 40, still expiring too soon
+```
+
+5. ADD MOMENTUM CONFIRMATION (prevent counter-trend entries):
+   
    Create new function before PlaceLimitOrder():
    
 ```mql5
-   double CalculateAdaptiveSL(bool isBullish, double sweepExtreme, bool isSilverBullet)
+   bool HasMomentumAlignment(bool setupBullish)
    {
-       // Get ATR for volatility-adjusted stops
-       int atrHandle = iATR(_Symbol, Period(), 14);
-       double atrBuffer[];
-       ArraySetAsSeries(atrBuffer, true);
-       CopyBuffer(atrHandle, 0, 0, 1, atrBuffer);
-       double atr = atrBuffer[0];
-       IndicatorRelease(atrHandle);
-       
-       // Base SL in pips
-       double baseSL = isSilverBullet ? InpSilverBulletSLPips : InpSLPips;
-       
-       // Adjust based on ATR (if ATR > 15 pips, widen stop)
-       double atrPips = atr / g_pipSize;
-       if(atrPips > 15.0)
-           baseSL *= (1.0 + (atrPips - 15.0) / 30.0); // Scale up in high volatility
-       
-       return baseSL * g_pipSize;
-   }
-```
-   
-   Update PlaceLimitOrder() to use this instead of fixed slDistance.
-
-4. ADD MULTI-TIMEFRAME CONFLUENCE:
-   Before PlaceLimitOrder(), add H1 structure check:
-   
-```mql5
-   bool IsH1StructureAligned(bool setupBullish)
-   {
-       if(Bars(_Symbol, PERIOD_H1) < 10) return true; // Pass if insufficient data
-       
-       double h1_high_recent = iHigh(_Symbol, PERIOD_H1, 1);
-       double h1_low_recent = iLow(_Symbol, PERIOD_H1, 1);
-       double h1_high_prev = iHigh(_Symbol, PERIOD_H1, 2);
-       double h1_low_prev = iLow(_Symbol, PERIOD_H1, 2);
-       
-       // Bullish: Recent H1 should show higher lows
-       if(setupBullish)
-           return (h1_low_recent > h1_low_prev);
-       
-       // Bearish: Recent H1 should show lower highs
-       return (h1_high_recent < h1_high_prev);
-   }
-```
-   
-   Call this before placing order. If false, skip setup.
-
-5. ENHANCE LOGGING FOR DEBUGGING:
-   In ScanForFVGAndEnter(), add detailed rejection logging:
-   
-```mql5
-   if(!IsStrongDisplacement(offset + 1, g_sweepBullish))
-   {
-       Log("FVG REJECTED [off=" + IntegerToString(offset) + "] | Weak displacement | " +
-           "BodyPct check or Pip check failed");
-       continue;
-   }
-   
-   if(fvgRange < InpMinFVGPips * g_pipSize)
-   {
-       Log("FVG REJECTED [off=" + IntegerToString(offset) + "] | Too small | " +
-           "Size=" + DoubleToString(fvgRange/g_pipSize, 1) + "p < " + 
-           IntegerToString(InpMinFVGPips) + "p minimum");
-       continue;
-   }
-```
-
-6. ADD SESSION QUALITY FILTER:
-   Reject setups during low-liquidity periods:
-   
-```mql5
-   bool IsLowLiquidityPeriod(const MqlDateTime &dt)
-   {
-       // Friday after 15:00 GMT
-       if(dt.day_of_week == 5 && dt.hour >= 15) return true;
-       
-       // Sunday (if broker allows trading)
-       if(dt.day_of_week == 0) return true;
-       
-       // Between NY close and Tokyo open (22:00-00:00 GMT)
-       if(dt.hour >= 22 || dt.hour < 1) return true;
-       
-       return false;
-   }
-```
-   
-   Check this in OnTick() before ScanForFVGAndEnter().
-
-7. VERIFY D1 EMA200 TREND FILTER:
-   In IsTrendAligned() function (should be around line 800):
-   - Ensure it's reading D1 EMA200 correctly
-   - Bullish setup requires: current_price > ema200_d1
-   - Bearish setup requires: current_price < ema200_d1
-   
-   If function doesn't exist, create it:
-   
-```mql5
-   bool IsTrendAligned(bool setupBullish)
-   {
-       if(g_ema200Handle == INVALID_HANDLE) return true; // Pass-through if indicator failed
-       
-       double emaBuffer[];
-       ArraySetAsSeries(emaBuffer, true);
-       if(CopyBuffer(g_ema200Handle, 0, 0, 1, emaBuffer) <= 0)
+       // Check last 3 M15 closes support direction
+       int bullishBars = 0;
+       for(int i = 1; i <= 3; i++)
        {
-           Log("TREND FILTER: Failed to read EMA200, passing through");
-           return true;
+           double open = iOpen(_Symbol, Period(), i);
+           double close = iClose(_Symbol, Period(), i);
+           if(close > open) bullishBars++;
        }
        
-       double ema200 = emaBuffer[0];
-       double currentPrice = (SymbolInfoDouble(_Symbol, SYMBOL_BID) + 
-                              SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
-       
        if(setupBullish)
-           return (currentPrice > ema200); // Buy only above EMA
+           return (bullishBars >= 2); // Need 2/3 bullish bars for buy
        else
-           return (currentPrice < ema200); // Sell only below EMA
+           return (bullishBars <= 1); // Need 2/3 bearish bars for sell
+   }
+```
+   
+   Call in PlaceLimitOrder() BEFORE trend filter:
+```mql5
+   if(!HasMomentumAlignment(g_sweepBullish))
+   {
+       Log("MOMENTUM: Setup rejected, recent bars against direction");
+       g_setupConsumed = true; return;
    }
 ```
 
-8. ADD POSITION SIZING SAFETY:
-   In CalculateLotSize(), add maximum risk cap:
+6. FIX TREND FILTER LOGIC (may be inverted):
    
+   In IsTrendAligned() verify:
 ```mql5
-   // After calculating lotSize, add:
-   double maxRiskAmount = accountBalance * 0.02; // Never risk more than 2% regardless
-   if(riskAmount > maxRiskAmount)
-       riskAmount = maxRiskAmount;
+   // Should use CLOSE price, not mid-price
+   double closeD1_current = iClose(_Symbol, PERIOD_D1, 0);
+   
+   if(setupBullish)
+       return (closeD1_current > ema200); // Correct
+   else
+       return (closeD1_current < ema200); // Correct
 ```
 
-VERIFICATION STEPS:
+7. OPTIMIZE PARAMETERS:
+   
+```mql5
+   input double InpRRRatio = 2.5;        // Was 3.0, too ambitious
+   input double InpSLPips = 25.0;        // Was 30, too wide
+   input int InpMinFVGPips = 4;          // Was 6, missing smaller valid FVGs
+   input bool InpEnableTrendFilter = true; // Keep enabled
+```
 
-After making changes:
-1. Compile the EA in MetaEditor — must compile with ZERO errors
-2. Check Journal tab for any warnings
-3. Verify all input parameters updated correctly
-4. Add Print() statement in OnInit() showing new parameter values
+COMPILE → Test Jan 2024 - Apr 2026 → Report:
+- Profit Factor
+- Win Rate % (target: >40%)
+- Total Trades (target: 30-50)
+- Max DD % (target: <18%)
 
-OUTPUT:
-- Save changes to ICT_LondonSweep_FVG_v3_backup.mq5
-- Generate a summary of all changes made
-- List any functions that were added or modified
-- Confirm compilation status
+ANALYSIS
+Progress: PF 0.68→1.05 ✅ | DD 39%→21% ✅ | Trades 42→16 ❌
+Problem: Filters TOO strict now. 16 trades in 2+ years = missed opportunities.
+Root Issue: Win rate 12.5% long / 25% short = entry timing wrong, not filter problem.
