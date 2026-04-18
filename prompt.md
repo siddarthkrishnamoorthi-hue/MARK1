@@ -74,8 +74,67 @@ GOAL
 These changes are intended to:
 
 Improve trade quality
+
+Replace Midpoint with OTE Entry (BIGGEST EDGE)
+
+Midpoint is safe—but OTE (62%–79%, ideally 70.5%) is where ICT edge actually lives.
+Avoids shallow retracements
+
+Fix FVG Timing. Even though you partially fixed it, it’s still fragile.
+Upgrade to:
+Allow multi-bar FVG formation window AFTER sweep
+Modify logic:
+After sweep:
+Keep scanning for FVG for next N bars
+Only kill setup AFTER timeout
+
+Add HTF Bias (REAL FILTER, NOT EMA)
+
+Your EMA filter was actually hurting performance.
+
+❌ Problem:
+
+EMA = lagging → kills good reversals
+
+✅ Replace with simple D1 candle bias:
+
+Add “Displacement Quality Score” (SMART FILTER)
+
+Right now displacement is binary → weak.
+
+✅ Upgrade:
+
+Instead of just pass/fail, score it
 Remove over-filtering
 Prevent late market entries
 Stabilize risk model
+
+mprove Risk Model (THIS BOOSTS PF DIRECTLY)
+Current:
+
+Fixed RR = 3.0
+
+Upgrade:
+
+Dynamic RR based on volatility:
+
+double rr = 2.0;
+
+if(fvgRange > 8 * g_pipSize)
+   rr = 3.0;
+else if(fvgRange < 4 * g_pipSize)
+   rr = 2.0;
+8. 🛑 Add Partial TP (HUGE PF BOOST)
+
+Instead of full TP:
+
+Close 50% at 1R
+Let rest run to 3R
+
+✅ Remove market entry fallback (you already did)
+🔥 Add OTE entry (BIGGEST WIN)
+⏱️ Fix FVG retry logic
+🧠 Add D1 bias
+🎯 Improve displacement filter
 
 Do not add new features. Only modify as instructed.
