@@ -1,26 +1,113 @@
-The six bugs ranked by damage
-Bug 1 — H4 BOS kills all buy trades (most damaging)
-IsH4BullishBOS() requires the most recent H4 swing high to be higher than the previous one. EURUSD spent much of 2024–2026 in a broad downtrend or range, so H4 was never printing clean higher-highs during London session. Every single bullish Judas setup got rejected here. This is why you have 0 buy trades. The filter is conceptually correct — you want directional bias alignment — but it's too tightly coupled to the macro trend rather than the local session structure.
-Bug 2 — FVG scan looks at only 3 bars (45 minutes on M15)
-This is the single biggest trade-killer. ScanForFVGAndEnter() checks high[1] vs high[3] and low[1] vs low[3] — literally only the last three candles. After a Judas sweep, price usually needs 5–15 bars to print the impulse move that creates the FVG. By the time the gap is obvious and clean, it's already 45–120 minutes old and your function can't see it. You're missing probably 80%+ of valid FVG setups just from this.
-Bug 3 — g_setupConsumed prevents all same-day retries
-Every filter rejection — H4, premium/discount, news, price check — immediately sets g_setupConsumed = true. So if H4 BOS rejects a 9:00 AM setup, the EA is completely blind for the rest of the day even if a perfect FVG prints at 2:00 PM in NY session with ideal structure. This flag should only be set when you actually place an order or make a deliberate "skip this entire day" decision. Remove it from all filter-rejection return paths.
-Bug 4 — Kill zone gate closes before FVG can form
-The OnTick() gate if(!(inLondon || inNY || inSilverBullet)) return exits early between sessions. A London sweep at 10:45 AM followed by an FVG forming at 11:15 AM (just outside the London window) never gets caught. ICT setups don't care about session boundaries after the sweep is established — the FVG is valid until price trades through it from the other side.
-Bug 5 — Silver Bullet is conceptually misimplemented
-The Silver Bullet at 15:00–16:00 GMT currently calls DetectJudasSwing() and compares against the 8-hour-old Asian range. That's not what Silver Bullet is. Correctly, SB should identify a fresh local liquidity pool from the NY morning (13:00–15:00 GMT), watch for a sweep of that pool in the 15:00–16:00 window, then look for an FVG in the 1-hour move. Trade 1 happened to work because price re-swept the Asian range at that time, but this is coincidental.
-Bug 6 — Order expiry + SL too tight
-10 bars = 150 minutes on M15. A London sweep order placed at 10:00 AM expires by 12:30 PM and never sees the NY open retracement. Set InpOrderExpiryBars = 25–30. The 20-pip SL is also tight for EURUSD — common wick extensions on M15 are 25–35 pips, so you'd get stopped before entry on fast days.
+Analysis:
+Longs: 17 taken, 1 win (5.88%) — essentially all losing. The bullish FVG logic or entry conditions are fundamentally broken without the H4 filter gatekeeping.
+Shorts: 17 taken, 5 wins (29.41%) — better but still losing.
+Root cause: Removing H4 filter opened the floodgates to counter-trend entries. The EA is now selling into uptrends and buying into downtrends blindly.
+The expanded FVG loop (1–15 bars) is finding stale FVGs that price has already partially filled, creating bad entry levels.
+No FVG validity check — the code doesn't verify the gap is still open before placing the limit.
 
-The fix sequence
-Do this first (trade frequency):
+In ICT_LondonSweep_FVG.mq5, apply these targeted fixes:
 
-In ScanForFVGAndEnter(), replace the single bar[1]/bar[3] check with a loop from i=1 to i=13, checking high[i+2] < low[i] (bullish FVG) or low[i+2] > high[i] (bearish FVG). Take the most recently formed gap.
-Remove g_setupConsumed = true from all filter rejection return statements. Add a g_lastRejectBar datetime guard to prevent re-firing on the same bar.
-Set InpEnableH4Filter = false temporarily. Run the backtest — you'll see how many setups now appear without it. Then replace it with a simpler iClose(PERIOD_H4, 1) > iMA(PERIOD_H4, 50) check instead of the swing-structure BOS.
-Set InpOrderExpiryBars = 25 and InpSLPips = 25.
+---
 
-5. After g_sweepDetected = true, allow ScanForFVGAndEnter() to keep running until 21:00 GMT regardless of inLondon/inNY flags.
-6. Rewrite Silver Bullet as a separate state machine: collect local NY morning range (13:00–15:00 GMT), detect sweep in SB window, scan for FVG in that window's bars.
-7. Enable InpEnablePDFilter and InpEnableWeeklyBias — these are already correctly coded, they just need to be switched on once your trade frequency is healthy.
-8. Add a full AMD (Accumulation–Manipulation–Distribution) model for the NY session with its own sweep detection separate from the London Judas logic.
+FIX 1 — Re-enable H4 filter with EMA bias (replace swing BOS logic)
+
+In IsH4BullishBOS(), replace the entire swing-scanning loop with:
+  double ema50 = iMA(Symbol(), PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE);
+  double h4close = iClose(Symbol(), PERIOD_H4, 1);
+  return (h4close > ema50);
+
+In IsH4BearishBOS(), replace with:
+  double ema50 = iMA(Symbol(), PERIOD_H4, 50, 0, MODE_EMA, PRICE_CLOSE);
+  double h4close = iClose(Symbol(), PERIOD_H4, 1);
+  return (h4close < ema50);
+
+Set InpEnableH4Filter default to true.
+
+---
+
+FIX 2 — Add FVG validity check in the scan loop
+
+In ScanForFVGAndEnter(), after the FVG loop finds a gap and sets g_fvgHigh/g_fvgLow/g_fvgMid, add this check before calling PlaceLimitOrder():
+
+For bullish FVG:
+  double currentAsk = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+  // Gap must still be open: current price must be ABOVE fvgHigh (gap not yet filled from below)
+  if (currentAsk <= g_fvgHigh) {
+    Log("BULLISH FVG already filled or price below gap. Skip.");
+    g_fvgFormed = false;
+    return;
+  }
+
+For bearish FVG:
+  double currentBid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+  // Gap must still be open: current price must be BELOW fvgLow (gap not yet filled from above)
+  if (currentBid >= g_fvgLow) {
+    Log("BEARISH FVG already filled or price above gap. Skip.");
+    g_fvgFormed = false;
+    return;
+  }
+
+---
+
+FIX 3 — Add minimum FVG size filter (avoid micro-gaps)
+
+After computing g_fvgMid, add:
+  double fvgSizePips = (g_fvgHigh - g_fvgLow) / g_pipSize;
+  if (fvgSizePips < 5.0) {
+    Log("FVG too small: " + DoubleToString(fvgSizePips, 1) + " pips. Skip.");
+    return;
+  }
+
+---
+
+FIX 4 — Fix g_setupConsumed: only set it on actual order placement
+
+Search the entire file for every occurrence of:
+  g_setupConsumed = true;
+that appears BEFORE a return statement inside a filter rejection block (H4, PD, weekly bias, news, price check).
+
+Remove g_setupConsumed = true from ALL of those filter-rejection paths.
+
+Keep g_setupConsumed = true ONLY in two places:
+  1. Immediately before g_trade.BuyLimit() / g_trade.SellLimit() is called.
+  2. After an order placement attempt regardless of success/failure.
+
+Add instead a per-bar rejection guard:
+  At the top of ScanForFVGAndEnter(), add:
+    static datetime lastScanBar = 0;
+    datetime currentBar = iTime(Symbol(), Period(), 0);
+    if (currentBar == lastScanBar) return;
+    lastScanBar = currentBar;
+
+---
+
+FIX 5 — Add D1 trend filter as additional confirmation
+
+Add a new function:
+  bool IsD1Bullish() {
+    double ema200 = iMA(Symbol(), PERIOD_D1, 200, 0, MODE_EMA, PRICE_CLOSE);
+    return (iClose(Symbol(), PERIOD_D1, 1) > ema200);
+  }
+
+In PlaceLimitOrder(), before placing any order:
+  bool d1Bull = IsD1Bullish();
+  if (g_sweepBullish && !d1Bull) {
+    Log("D1 FILTER: BUY rejected — price below D1 EMA200.");
+    return;   // do NOT set g_setupConsumed here
+  }
+  if (!g_sweepBullish && d1Bull) {
+    Log("D1 FILTER: SELL rejected — price above D1 EMA200.");
+    return;   // do NOT set g_setupConsumed here
+  }
+
+---
+
+FIX 6 — Increase default SL to 25 pips and order expiry to 25 bars
+
+Change:
+  input double InpSLPips = 20.0   →  input double InpSLPips = 25.0
+  input int InpOrderExpiryBars = 10  →  input int InpOrderExpiryBars = 25
+
+---
+
+After all changes, compile, then backtest on EURUSD M15 from Jan 2024 to Apr 2026 with $10,000 initial deposit and report the results.
