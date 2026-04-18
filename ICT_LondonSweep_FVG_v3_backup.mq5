@@ -22,8 +22,8 @@ enum ENUM_OB_STATE
 
 input group "=== Risk Management ==="
 input double InpRiskPercent            = 0.5;   // Risk per trade (% of balance)
-input double InpRRRatio                = 3.0;   // Take Profit RR ratio
-input double InpSLPips                 = 30.0;  // Stop Loss in pips beyond sweep
+input double InpRRRatio                = 2.5;   // Take Profit RR ratio
+input double InpSLPips                 = 25.0;  // Stop Loss in pips beyond sweep
 input int    InpMaxOpenTrades          = 2;     // Maximum simultaneous open positions
 
 input group "=== Session Times (GMT) ==="
@@ -59,16 +59,16 @@ input double InpOBProximityPips        = 10.0;  // Max distance from OB zone
 input int    InpOBMaxAgeHours          = 24;    // Discard OBs older than N hours
 
 input group "=== Order Settings ==="
-input int    InpOrderExpiryBars        = 40;    // Expire pending order after N bars
+input int    InpOrderExpiryBars        = 60;    // Expire pending order after N bars
 input int    InpMagicNumber            = 202601;
 
 input group "=== Strong Displacement Filter ==="
-input int    InpMinDisplacementBodyPct = 75;    // Min body as % of bar range
-input int    InpMinDisplacementPips    = 10;    // Min body size in pips
+input int    InpMinDisplacementBodyPct = 65;    // Min body as % of bar range
+input int    InpMinDisplacementPips    = 8;     // Min body size in pips
 
 input group "=== FVG Settings ==="
 input int    InpFVGScanBars            = 5;     // Rolling window bars to search for FVG after sweep
-input int    InpMinFVGPips             = 6;     // Minimum FVG gap in pips
+input int    InpMinFVGPips             = 4;     // Minimum FVG gap in pips
 
 input group "=== D1 Trend Filter ==="
 input bool   InpEnableTrendFilter      = true;  // Gate entries to D1 200 EMA direction
@@ -188,6 +188,8 @@ int OnInit()
          " | MinBodyPct=", InpMinDisplacementBodyPct, "%",
          " | MinDisplPips=", InpMinDisplacementPips,
          " | MinFVGPips=", InpMinFVGPips,
+         " | RR=", InpRRRatio,
+         " | SLpips=", InpSLPips,
          " | TrendFilter=", (InpEnableTrendFilter ? "ON" : "OFF"),
          " | RiskPct=", InpRiskPercent);
 
@@ -397,12 +399,15 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
                    IntegerToString(InpMinFVGPips) + "p minimum");
                continue;
             }
-            g_fvgMid    = g_fvgHigh - fvgRange * 0.25;
+            double entryDepth = 0.5;                               // default 50% midpoint
+            if(fvgRange > 8.0 * g_pipSize)       entryDepth = 0.382; // large FVG: 38.2% fib
+            else if(fvgRange < 5.0 * g_pipSize)  entryDepth = 0.618; // small FVG: 61.8% fib
+            g_fvgMid    = g_fvgHigh - fvgRange * entryDepth;
             g_fvgFormed = true;
             fvgFound    = true;
             Log("BULLISH FVG ACCEPTED [off=" + IntegerToString(offset) + "] | Zone: " +
                 DoubleToString(g_fvgLow, _Digits) + "-" + DoubleToString(g_fvgHigh, _Digits) +
-                " | Entry25%=" + DoubleToString(g_fvgMid, _Digits) +
+                " | Entry(" + DoubleToString(entryDepth * 100.0, 1) + "%)=" + DoubleToString(g_fvgMid, _Digits) +
                 " | Size=" + DoubleToString(fvgRange / g_pipSize, 1) + "p");
          }
       }
@@ -428,12 +433,15 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
                    IntegerToString(InpMinFVGPips) + "p minimum");
                continue;
             }
-            g_fvgMid    = g_fvgLow + fvgRange * 0.25;
+            double entryDepth = 0.5;                               // default 50% midpoint
+            if(fvgRange > 8.0 * g_pipSize)       entryDepth = 0.382; // large FVG: 38.2% fib
+            else if(fvgRange < 5.0 * g_pipSize)  entryDepth = 0.618; // small FVG: 61.8% fib
+            g_fvgMid    = g_fvgLow + fvgRange * entryDepth;
             g_fvgFormed = true;
             fvgFound    = true;
             Log("BEARISH FVG ACCEPTED [off=" + IntegerToString(offset) + "] | Zone: " +
                 DoubleToString(g_fvgLow, _Digits) + "-" + DoubleToString(g_fvgHigh, _Digits) +
-                " | Entry25%=" + DoubleToString(g_fvgMid, _Digits) +
+                " | Entry(" + DoubleToString(entryDepth * 100.0, 1) + "%)=" + DoubleToString(g_fvgMid, _Digits) +
                 " | Size=" + DoubleToString(fvgRange / g_pipSize, 1) + "p");
          }
       }
@@ -520,6 +528,26 @@ bool IsLowLiquidityPeriod(const MqlDateTime &dt)
 }
 
 //+------------------------------------------------------------------+
+//| HasMomentumAlignment                                             |
+//|  Counts bullish bars among the 3 most recent completed candles.  |
+//|  Bullish setup requires >= 2/3 bullish. Bearish >= 2/3 bearish.  |
+//+------------------------------------------------------------------+
+bool HasMomentumAlignment(bool setupBullish)
+{
+   int bullishBars = 0;
+   for(int i = 1; i <= 3; i++)
+   {
+      if(iClose(_Symbol, Period(), i) > iOpen(_Symbol, Period(), i))
+         bullishBars++;
+   }
+
+   if(setupBullish)
+      return (bullishBars >= 2); // Need 2/3 bullish bars for a buy
+   else
+      return (bullishBars <= 1); // Need 2/3 bearish bars for a sell
+}
+
+//+------------------------------------------------------------------+
 //| PlaceLimitOrder                                                    |
 //+------------------------------------------------------------------+
 void PlaceLimitOrder(bool isSilverBullet = false)
@@ -570,6 +598,11 @@ void PlaceLimitOrder(bool isSilverBullet = false)
          Log("OB OK | " + DoubleToString(g_obLow,_Digits) + "-" + DoubleToString(g_obHigh,_Digits));
       }
    }
+   if(!HasMomentumAlignment(g_sweepBullish))
+   {
+      Log("MOMENTUM: Setup rejected, recent bars against direction.");
+      g_setupConsumed = true; return;
+   }
    if(InpEnableTrendFilter && !IsTrendAligned(g_sweepBullish))
    {
       Log("TREND FILTER: Setup rejected — price against D1 EMA200 direction.");
@@ -606,6 +639,44 @@ void PlaceLimitOrder(bool isSilverBullet = false)
 
    if(g_sweepBullish  && tpPrice <= entryPrice) { Log("Invalid TP (BUY).");  g_setupConsumed=true; return; }
    if(!g_sweepBullish && tpPrice >= entryPrice) { Log("Invalid TP (SELL)."); g_setupConsumed=true; return; }
+
+   // Market-entry fallback: if price is already inside the FVG zone, fill at market immediately
+   double currentMktPrice = g_sweepBullish ?
+       SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
+       SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   bool priceInZone = g_sweepBullish ?
+       (currentMktPrice >= g_fvgLow && currentMktPrice <= entryPrice) :
+       (currentMktPrice <= g_fvgHigh && currentMktPrice >= entryPrice);
+
+   if(priceInZone)
+   {
+      double mktTP   = g_sweepBullish ?
+          currentMktPrice + InpRRRatio * (currentMktPrice - slPrice) :
+          currentMktPrice - InpRRRatio * (slPrice - currentMktPrice);
+      double mktLots = CalculateLotSize(MathAbs(currentMktPrice - slPrice));
+      if(mktLots <= 0) { Log("MARKET ENTRY ERROR: Lots<=0."); g_setupConsumed=true; return; }
+      g_setupConsumed = true;
+
+      bool mktResult = g_sweepBullish ?
+          g_trade.Buy(mktLots, _Symbol, 0, slPrice, mktTP,
+                      "ICT-FVG MktBuy" + (isSilverBullet ? "-SB|" : "|") + TimeToString(TimeCurrent())) :
+          g_trade.Sell(mktLots, _Symbol, 0, slPrice, mktTP,
+                       "ICT-FVG MktSell" + (isSilverBullet ? "-SB|" : "|") + TimeToString(TimeCurrent()));
+      if(mktResult)
+      {
+         g_pendingTicket   = g_trade.ResultOrder();
+         g_pendingBarCount = 0;
+         Log("MARKET ENTRY | FVG zone | Entry=" + DoubleToString(currentMktPrice, _Digits) +
+             " SL=" + DoubleToString(slPrice, _Digits) +
+             " TP=" + DoubleToString(mktTP, _Digits) +
+             " Lots=" + DoubleToString(mktLots, 2) +
+             (isSilverBullet ? " [SILVER BULLET]" : ""));
+      }
+      else
+         Log("MARKET ENTRY FAILED | RC=" + IntegerToString(g_trade.ResultRetcode()) +
+             " " + g_trade.ResultRetcodeDescription());
+      return;
+   }
 
    double lotSize = CalculateLotSize(MathAbs(entryPrice - slPrice));
    if(lotSize <= 0) { Log("ERROR: Lots<=0."); g_setupConsumed=true; return; }
@@ -1164,16 +1235,15 @@ bool IsTrendAligned(bool isBullishSetup)
       return true;
    }
 
-   double ema200       = emaBuffer[0];
-   double currentPrice = (SymbolInfoDouble(_Symbol, SYMBOL_BID) +
-                          SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
+   double ema200  = emaBuffer[0];
+   double closeD1 = iClose(_Symbol, PERIOD_D1, 0); // Current forming D1 candle (most responsive)
 
-   Log("TrendFilter: Price=" + DoubleToString(currentPrice, _Digits) +
+   Log("TrendFilter: D1Close=" + DoubleToString(closeD1, _Digits) +
        " EMA200=" + DoubleToString(ema200, _Digits) +
        " Setup=" + (isBullishSetup ? "BUY" : "SELL"));
 
-   if(isBullishSetup)  return (currentPrice > ema200); // Buy only above EMA200
-   else                return (currentPrice < ema200); // Sell only below EMA200
+   if(isBullishSetup)  return (closeD1 > ema200); // Buy only above EMA200
+   else                return (closeD1 < ema200); // Sell only below EMA200
 }
 
 //+------------------------------------------------------------------+
