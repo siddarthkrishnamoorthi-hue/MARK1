@@ -21,9 +21,9 @@ enum ENUM_OB_STATE
 #include <Trade\OrderInfo.mqh>
 
 input group "=== Risk Management ==="
-input double InpRiskPercent            = 0.5;   // Risk per trade (% of balance)
-input double InpRRRatio                = 2.5;   // Take Profit RR ratio
-input double InpSLPips                 = 25.0;  // Stop Loss in pips beyond sweep
+input double InpRiskPercent            = 0.1;   // Risk per trade (% of balance)
+input double InpRRRatio                = 3.0;   // Take Profit RR ratio
+input double InpSLPips                 = 30.0;  // Stop Loss in pips beyond sweep
 input int    InpMaxOpenTrades          = 2;     // Maximum simultaneous open positions
 
 input group "=== Session Times (GMT) ==="
@@ -59,19 +59,19 @@ input double InpOBProximityPips        = 10.0;  // Max distance from OB zone
 input int    InpOBMaxAgeHours          = 24;    // Discard OBs older than N hours
 
 input group "=== Order Settings ==="
-input int    InpOrderExpiryBars        = 60;    // Expire pending order after N bars
+input int    InpOrderExpiryBars        = 10;    // Expire pending order after N bars
 input int    InpMagicNumber            = 202601;
 
 input group "=== Strong Displacement Filter ==="
-input int    InpMinDisplacementBodyPct = 65;    // Min body as % of bar range
-input int    InpMinDisplacementPips    = 8;     // Min body size in pips
+input int    InpMinDisplacementBodyPct = 60;    // Min body as % of bar range
+input int    InpMinDisplacementPips    = 6;     // Min body size in pips
 
 input group "=== FVG Settings ==="
 input int    InpFVGScanBars            = 5;     // Rolling window bars to search for FVG after sweep
-input int    InpMinFVGPips             = 4;     // Minimum FVG gap in pips
+input int    InpMinFVGPips             = 3;     // Minimum FVG gap in pips
 
 input group "=== D1 Trend Filter ==="
-input bool   InpEnableTrendFilter      = true;  // Gate entries to D1 200 EMA direction
+input bool   InpEnableTrendFilter      = false; // Gate entries to D1 candle bias direction
 
 input group "=== Daily Loss Circuit Breaker ==="
 input double InpDailyLossLimitPct      = 1.5;   // Daily equity drawdown % to halt
@@ -116,6 +116,7 @@ datetime g_obTime           = 0;
 int      g_gmtOffset        = 0;
 double   g_pipSize          = 0.0;
 datetime g_lastBarTime      = 0;
+int      g_activeSessionId  = -1;  // 0=London 1=NY 2=SilverBullet; resets each new session
 
 int      g_ema200Handle       = INVALID_HANDLE;
 int      g_atrHandle          = INVALID_HANDLE;
@@ -188,10 +189,11 @@ int OnInit()
          " | MinBodyPct=", InpMinDisplacementBodyPct, "%",
          " | MinDisplPips=", InpMinDisplacementPips,
          " | MinFVGPips=", InpMinFVGPips,
-         " | RR=", InpRRRatio,
+         " | BaseRR=", InpRRRatio, "(dynamic)",
          " | SLpips=", InpSLPips,
-         " | TrendFilter=", (InpEnableTrendFilter ? "ON" : "OFF"),
-         " | RiskPct=", InpRiskPercent);
+         " | TrendFilter=", (InpEnableTrendFilter ? "ON(D1Bias)" : "OFF"),
+         " | RiskPct=", InpRiskPercent,
+         " | Entry=OTE70.5% | PartialTP@1R+3Rrunner");
 
    return INIT_SUCCEEDED;
 }
@@ -285,15 +287,38 @@ void OnTick()
    if(!(inLondon || inNY || inSilverBullet) || !g_asianRangeSet)
       return;
 
+   // Per-session sweep reset: each of London, NY, and Silver Bullet gets a fresh
+   // sweep opportunity, allowing up to InpMaxOpenTrades entries per session.
+   int currentSessionId = inSilverBullet ? 2 : (inNY ? 1 : 0);
+   if(currentSessionId != g_activeSessionId)
+   {
+      if(g_pendingTicket != 0)
+      {
+         for(int k = OrdersTotal() - 1; k >= 0; k--)
+         {
+            if(OrderGetTicket(k) == g_pendingTicket)
+            { g_trade.OrderDelete(g_pendingTicket); break; }
+         }
+         g_pendingTicket   = 0;
+         g_pendingBarCount = 0;
+      }
+      g_sweepDetected   = false;
+      g_sweepBullish    = false;
+      g_sweepExtreme    = 0.0;
+      g_sweepTime       = 0;
+      g_fvgFormed       = false;
+      g_fvgHigh         = 0.0;
+      g_fvgLow          = 0.0;
+      g_fvgMid          = 0.0;
+      g_setupConsumed   = false;
+      g_activeSessionId = currentSessionId;
+      Log("SESSION RESET | ID=" + IntegerToString(g_activeSessionId) +
+          " (0=London 1=NY 2=SilverBullet)");
+   }
+
    if(InpEnableNewsFilter && IsNewsTime(gmtTime))
    {
       Log("NEWS FILTER: halted.");
-      return;
-   }
-
-   if(IsLowLiquidityPeriod(gmtDt))
-   {
-      Log("LOW LIQUIDITY: halted.");
       return;
    }
 
@@ -399,15 +424,12 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
                    IntegerToString(InpMinFVGPips) + "p minimum");
                continue;
             }
-            double entryDepth = 0.5;                               // default 50% midpoint
-            if(fvgRange > 8.0 * g_pipSize)       entryDepth = 0.382; // large FVG: 38.2% fib
-            else if(fvgRange < 5.0 * g_pipSize)  entryDepth = 0.618; // small FVG: 61.8% fib
-            g_fvgMid    = g_fvgHigh - fvgRange * entryDepth;
+            g_fvgMid    = g_fvgHigh - fvgRange * 0.705; // OTE: 70.5% from top of FVG (ICT optimal entry)
             g_fvgFormed = true;
             fvgFound    = true;
             Log("BULLISH FVG ACCEPTED [off=" + IntegerToString(offset) + "] | Zone: " +
                 DoubleToString(g_fvgLow, _Digits) + "-" + DoubleToString(g_fvgHigh, _Digits) +
-                " | Entry(" + DoubleToString(entryDepth * 100.0, 1) + "%)=" + DoubleToString(g_fvgMid, _Digits) +
+                " | OTE=" + DoubleToString(g_fvgMid, _Digits) +
                 " | Size=" + DoubleToString(fvgRange / g_pipSize, 1) + "p");
          }
       }
@@ -433,15 +455,12 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
                    IntegerToString(InpMinFVGPips) + "p minimum");
                continue;
             }
-            double entryDepth = 0.5;                               // default 50% midpoint
-            if(fvgRange > 8.0 * g_pipSize)       entryDepth = 0.382; // large FVG: 38.2% fib
-            else if(fvgRange < 5.0 * g_pipSize)  entryDepth = 0.618; // small FVG: 61.8% fib
-            g_fvgMid    = g_fvgLow + fvgRange * entryDepth;
+            g_fvgMid    = g_fvgLow + fvgRange * 0.705; // OTE: 70.5% from bottom of FVG (ICT optimal entry)
             g_fvgFormed = true;
             fvgFound    = true;
             Log("BEARISH FVG ACCEPTED [off=" + IntegerToString(offset) + "] | Zone: " +
                 DoubleToString(g_fvgLow, _Digits) + "-" + DoubleToString(g_fvgHigh, _Digits) +
-                " | Entry(" + DoubleToString(entryDepth * 100.0, 1) + "%)=" + DoubleToString(g_fvgMid, _Digits) +
+                " | OTE=" + DoubleToString(g_fvgMid, _Digits) +
                 " | Size=" + DoubleToString(fvgRange / g_pipSize, 1) + "p");
          }
       }
@@ -451,100 +470,22 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
       PlaceLimitOrder(isSilverBullet);
    else
    {
-      // Only permanently consume the setup once we are past the Judas window.
-      // If still inside the kill zone, leave g_setupConsumed=false so the next
-      // bar re-runs the scan — the FVG may not have formed yet.
+      // Consume setup only when the current session window has closed.
+      // While inside the window, leave g_setupConsumed=false to retry each bar.
       MqlDateTime gmtDtScan;
       TimeToStruct(GetGMTTime(), gmtDtScan);
-      if(gmtDtScan.hour >= InpJudasEndHour + 1)
+      int sessionEnd = isSilverBullet          ? InpSilverBulletEnd  :
+                       (g_activeSessionId == 1) ? InpNYEndHour        :
+                       InpJudasEndHour + 1; // London default
+      if(gmtDtScan.hour >= sessionEnd)
       {
-         Log("FVG SCAN: no valid FVG in " + IntegerToString(InpFVGScanBars - 2) +
-             "-bar window after sweep. Past Judas window — setup consumed.");
+         Log("FVG SCAN: no valid FVG | session expired (hour>=" +
+             IntegerToString(sessionEnd) + ") — setup consumed.");
          g_setupConsumed = true;
       }
       else
-         Log("FVG SCAN: no valid FVG yet in " + IntegerToString(InpFVGScanBars - 2) +
-             "-bar window — will retry next bar.");
+         Log("FVG SCAN: no valid FVG yet — will retry next bar.");
    }
-}
-
-//+------------------------------------------------------------------+
-//| CalculateAdaptiveSL                                              |
-//|  Returns the stop-loss distance in price units, widened when     |
-//|  ATR(14) exceeds 15 pips to account for elevated volatility.     |
-//+------------------------------------------------------------------+
-double CalculateAdaptiveSL(bool isBullish, double sweepExtreme, bool isSilverBullet)
-{
-   double baseSL = isSilverBullet ? InpSilverBulletSLPips : InpSLPips;
-
-   if(g_atrHandle != INVALID_HANDLE)
-   {
-      double atrBuffer[1];
-      if(CopyBuffer(g_atrHandle, 0, 0, 1, atrBuffer) > 0 && g_pipSize > 0.0)
-      {
-         double atrPips = atrBuffer[0] / g_pipSize;
-         if(atrPips > 15.0)
-            baseSL *= (1.0 + (atrPips - 15.0) / 30.0); // Scale up in high volatility
-      }
-   }
-
-   Log("AdaptiveSL: base=" + DoubleToString(isSilverBullet ? InpSilverBulletSLPips : InpSLPips, 1) +
-       "p -> adjusted=" + DoubleToString(baseSL, 1) + "p");
-   return baseSL * g_pipSize;
-}
-
-//+------------------------------------------------------------------+
-//| IsH1StructureAligned                                             |
-//|  Bullish: last completed H1 bar made a higher low than the prior |
-//|  Bearish: last completed H1 bar made a lower high than the prior |
-//+------------------------------------------------------------------+
-bool IsH1StructureAligned(bool setupBullish)
-{
-   if(Bars(_Symbol, PERIOD_H1) < 10) return true; // Pass if insufficient data
-
-   double h1_high_recent = iHigh(_Symbol, PERIOD_H1, 1);
-   double h1_low_recent  = iLow(_Symbol,  PERIOD_H1, 1);
-   double h1_high_prev   = iHigh(_Symbol, PERIOD_H1, 2);
-   double h1_low_prev    = iLow(_Symbol,  PERIOD_H1, 2);
-
-   if(setupBullish)
-      return (h1_low_recent > h1_low_prev);   // Bullish: higher lows
-   return (h1_high_recent < h1_high_prev);    // Bearish: lower highs
-}
-
-//+------------------------------------------------------------------+
-//| IsLowLiquidityPeriod                                             |
-//|  Returns true during known low-liquidity windows:                |
-//|   - Friday >= 15:00 GMT                                          |
-//|   - Sunday                                                       |
-//|   - NY close to Tokyo open (22:00-00:59 GMT)                     |
-//+------------------------------------------------------------------+
-bool IsLowLiquidityPeriod(const MqlDateTime &dt)
-{
-   if(dt.day_of_week == 5 && dt.hour >= 15) return true; // Friday close
-   if(dt.day_of_week == 0) return true;                   // Sunday
-   if(dt.hour >= 22 || dt.hour < 1) return true;          // Dead zone
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| HasMomentumAlignment                                             |
-//|  Counts bullish bars among the 3 most recent completed candles.  |
-//|  Bullish setup requires >= 2/3 bullish. Bearish >= 2/3 bearish.  |
-//+------------------------------------------------------------------+
-bool HasMomentumAlignment(bool setupBullish)
-{
-   int bullishBars = 0;
-   for(int i = 1; i <= 3; i++)
-   {
-      if(iClose(_Symbol, Period(), i) > iOpen(_Symbol, Period(), i))
-         bullishBars++;
-   }
-
-   if(setupBullish)
-      return (bullishBars >= 2); // Need 2/3 bullish bars for a buy
-   else
-      return (bullishBars <= 1); // Need 2/3 bearish bars for a sell
 }
 
 //+------------------------------------------------------------------+
@@ -598,22 +539,17 @@ void PlaceLimitOrder(bool isSilverBullet = false)
          Log("OB OK | " + DoubleToString(g_obLow,_Digits) + "-" + DoubleToString(g_obHigh,_Digits));
       }
    }
-   if(!HasMomentumAlignment(g_sweepBullish))
-   {
-      Log("MOMENTUM: Setup rejected, recent bars against direction.");
-      g_setupConsumed = true; return;
-   }
    if(InpEnableTrendFilter && !IsTrendAligned(g_sweepBullish))
    {
-      Log("TREND FILTER: Setup rejected — price against D1 EMA200 direction.");
+      Log("TREND FILTER: Setup rejected — D1 candle direction misaligned.");
       g_setupConsumed = true; return;
    }
-   if(!IsH1StructureAligned(g_sweepBullish))
-   {
-      Log("H1 STRUCTURE: Setup rejected — H1 market structure misaligned.");
-      g_setupConsumed = true; return;
-   }
-   double slDistance = CalculateAdaptiveSL(g_sweepBullish, g_sweepExtreme, isSilverBullet);
+   // Dynamic RR: scale target based on FVG size for better risk-adjusted outcomes
+   double fvgRange   = g_fvgHigh - g_fvgLow;
+   double dynamicRR  = (fvgRange > 8.0 * g_pipSize) ? 3.0 :
+                       (fvgRange < 4.0 * g_pipSize) ? 2.0 : InpRRRatio;
+   double slPips     = isSilverBullet ? InpSilverBulletSLPips : InpSLPips;
+   double slDistance = slPips * g_pipSize;
 
    double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
    double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
@@ -624,7 +560,7 @@ void PlaceLimitOrder(bool isSilverBullet = false)
    {
       entryPrice = g_fvgMid;
       slPrice    = g_sweepExtreme - slDistance;
-      tpPrice    = entryPrice + (InpRRRatio * (entryPrice - slPrice));
+      tpPrice    = entryPrice + (dynamicRR * (entryPrice - slPrice));
       orderType  = ORDER_TYPE_BUY_LIMIT;
       if(entryPrice >= ask) { Log("BUY skipped: FVG mid>=Ask."); g_setupConsumed=true; return; }
    }
@@ -632,51 +568,13 @@ void PlaceLimitOrder(bool isSilverBullet = false)
    {
       entryPrice = g_fvgMid;
       slPrice    = g_sweepExtreme + slDistance;
-      tpPrice    = entryPrice - (InpRRRatio * (slPrice - entryPrice));
+      tpPrice    = entryPrice - (dynamicRR * (slPrice - entryPrice));
       orderType  = ORDER_TYPE_SELL_LIMIT;
       if(entryPrice <= bid) { Log("SELL skipped: FVG mid<=Bid."); g_setupConsumed=true; return; }
    }
 
    if(g_sweepBullish  && tpPrice <= entryPrice) { Log("Invalid TP (BUY).");  g_setupConsumed=true; return; }
    if(!g_sweepBullish && tpPrice >= entryPrice) { Log("Invalid TP (SELL)."); g_setupConsumed=true; return; }
-
-   // Market-entry fallback: if price is already inside the FVG zone, fill at market immediately
-   double currentMktPrice = g_sweepBullish ?
-       SymbolInfoDouble(_Symbol, SYMBOL_ASK) :
-       SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   bool priceInZone = g_sweepBullish ?
-       (currentMktPrice >= g_fvgLow && currentMktPrice <= entryPrice) :
-       (currentMktPrice <= g_fvgHigh && currentMktPrice >= entryPrice);
-
-   if(priceInZone)
-   {
-      double mktTP   = g_sweepBullish ?
-          currentMktPrice + InpRRRatio * (currentMktPrice - slPrice) :
-          currentMktPrice - InpRRRatio * (slPrice - currentMktPrice);
-      double mktLots = CalculateLotSize(MathAbs(currentMktPrice - slPrice));
-      if(mktLots <= 0) { Log("MARKET ENTRY ERROR: Lots<=0."); g_setupConsumed=true; return; }
-      g_setupConsumed = true;
-
-      bool mktResult = g_sweepBullish ?
-          g_trade.Buy(mktLots, _Symbol, 0, slPrice, mktTP,
-                      "ICT-FVG MktBuy" + (isSilverBullet ? "-SB|" : "|") + TimeToString(TimeCurrent())) :
-          g_trade.Sell(mktLots, _Symbol, 0, slPrice, mktTP,
-                       "ICT-FVG MktSell" + (isSilverBullet ? "-SB|" : "|") + TimeToString(TimeCurrent()));
-      if(mktResult)
-      {
-         g_pendingTicket   = g_trade.ResultOrder();
-         g_pendingBarCount = 0;
-         Log("MARKET ENTRY | FVG zone | Entry=" + DoubleToString(currentMktPrice, _Digits) +
-             " SL=" + DoubleToString(slPrice, _Digits) +
-             " TP=" + DoubleToString(mktTP, _Digits) +
-             " Lots=" + DoubleToString(mktLots, 2) +
-             (isSilverBullet ? " [SILVER BULLET]" : ""));
-      }
-      else
-         Log("MARKET ENTRY FAILED | RC=" + IntegerToString(g_trade.ResultRetcode()) +
-             " " + g_trade.ResultRetcodeDescription());
-      return;
-   }
 
    double lotSize = CalculateLotSize(MathAbs(entryPrice - slPrice));
    if(lotSize <= 0) { Log("ERROR: Lots<=0."); g_setupConsumed=true; return; }
@@ -1044,6 +942,7 @@ void ResetDailyState(datetime currentGMT)
    g_setupConsumed  = false;
    g_pendingTicket  = 0;
    g_pendingBarCount = 0;
+   g_activeSessionId = -1;  // reset so next day's first session triggers a fresh sweep scan
    g_obState        = OB_NONE;
    g_obHigh         = 0.0;
    g_obLow          = 0.0;
@@ -1226,24 +1125,20 @@ bool IsStrongDisplacement(int barIndex, bool isBullish)
 bool IsTrendAligned(bool isBullishSetup)
 {
    if(!InpEnableTrendFilter) return true;
-   if(g_ema200Handle == INVALID_HANDLE) return true;
+   if(Bars(_Symbol, PERIOD_D1) < 2) return true; // Insufficient D1 history
 
-   double emaBuffer[1];
-   if(CopyBuffer(g_ema200Handle, 0, 0, 1, emaBuffer) < 1)
-   {
-      Log("TREND FILTER: Failed to read EMA200, passing through.");
-      return true;
-   }
+   // D1 candle direction bias: avoids EMA lag by reading most recent completed candle.
+   // Bullish D1 (close > open) supports buys; Bearish D1 supports sells.
+   double d1Open  = iOpen(_Symbol,  PERIOD_D1, 1);
+   double d1Close = iClose(_Symbol, PERIOD_D1, 1);
+   bool   d1Bull  = (d1Close > d1Open);
 
-   double ema200  = emaBuffer[0];
-   double closeD1 = iClose(_Symbol, PERIOD_D1, 0); // Current forming D1 candle (most responsive)
-
-   Log("TrendFilter: D1Close=" + DoubleToString(closeD1, _Digits) +
-       " EMA200=" + DoubleToString(ema200, _Digits) +
+   Log("D1 Bias: O=" + DoubleToString(d1Open, _Digits) +
+       " C=" + DoubleToString(d1Close, _Digits) +
+       " Dir=" + (d1Bull ? "BULL" : "BEAR") +
        " Setup=" + (isBullishSetup ? "BUY" : "SELL"));
 
-   if(isBullishSetup)  return (closeD1 > ema200); // Buy only above EMA200
-   else                return (closeD1 < ema200); // Sell only below EMA200
+   return (isBullishSetup == d1Bull);
 }
 
 //+------------------------------------------------------------------+
@@ -1265,9 +1160,10 @@ void CloseAllPositions()
    }
 }
 
-// Moves SL to breakeven once price reaches 1R profit.
+// At 1R profit: close 50% (partial TP), move SL to breakeven, extend remaining TP to 3R.
 void ManageOpenPositions()
 {
+   double buffer = _Point;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -1275,44 +1171,52 @@ void ManageOpenPositions()
       if(g_position.Symbol() != Symbol())    continue;
       if(g_position.Magic()  != InpMagicNumber) continue;
 
-      double entry  = g_position.PriceOpen();
-      double sl     = g_position.StopLoss();
-      double bid    = SymbolInfoDouble(Symbol(), SYMBOL_BID);
-      double ask    = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
-      double buffer = _Point;
+      double entry = g_position.PriceOpen();
+      double sl    = g_position.StopLoss();
+      if(sl <= 0.0) continue;
 
-      // SL already at or beyond breakeven — nothing to do
-      if(g_position.PositionType() == POSITION_TYPE_BUY  && sl >= entry) continue;
-      if(g_position.PositionType() == POSITION_TYPE_SELL && sl <= entry && sl > 0) continue;
+      bool   isBuy       = (g_position.PositionType() == POSITION_TYPE_BUY);
+      double initialRisk = isBuy ? (entry - sl) : (sl - entry);
+      if(initialRisk <= 0.0) continue;
 
-      if(g_position.PositionType() == POSITION_TYPE_BUY)
+      // SL at/past entry means partial TP + BE were already applied
+      bool atBE = isBuy ? (sl >= entry) : (sl <= entry);
+      if(atBE) continue;
+
+      double bid     = SymbolInfoDouble(Symbol(), SYMBOL_BID);
+      double ask     = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
+      double target1R = isBuy ? (entry + initialRisk) : (entry - initialRisk);
+      bool   at1R    = isBuy ? (bid >= target1R) : (ask <= target1R);
+      if(!at1R) continue;
+
+      // --- Partial close 50% at 1R ---
+      double vol     = g_position.Volume();
+      double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double halfVol = MathMax(MathFloor(vol * 0.5 / lotStep) * lotStep, minLot);
+      if(halfVol < vol)
       {
-         if(sl <= 0.0) continue;
-         double initialRisk = entry - sl;
-         if(initialRisk <= 0.0) continue;
-         double targetBE    = entry + initialRisk;
-         if(bid >= targetBE)
-         {
-            double newSL = NormalizeDouble(entry + buffer, _Digits);
-            if(g_trade.PositionModify(ticket, newSL, g_position.TakeProfit()))
-               Log("BREAKEVEN SET | #" + IntegerToString(ticket) +
-                   " Buy | New SL=" + DoubleToString(newSL, _Digits));
-         }
+         bool partOK = isBuy ?
+             g_trade.Sell(halfVol, _Symbol, 0, 0, 0, "ICT-PartialTP") :
+             g_trade.Buy(halfVol,  _Symbol, 0, 0, 0, "ICT-PartialTP");
+         Log(partOK ?
+             "PARTIAL TP | #" + IntegerToString(ticket) + " " + DoubleToString(halfVol, 2) + " lots closed at 1R" :
+             "PARTIAL TP FAILED | RC=" + IntegerToString(g_trade.ResultRetcode()));
       }
-      else if(g_position.PositionType() == POSITION_TYPE_SELL)
-      {
-         if(sl <= 0.0) continue;
-         double initialRisk = sl - entry;
-         if(initialRisk <= 0.0) continue;
-         double targetBE    = entry - initialRisk;
-         if(ask <= targetBE)
-         {
-            double newSL = NormalizeDouble(entry - buffer, _Digits);
-            if(g_trade.PositionModify(ticket, newSL, g_position.TakeProfit()))
-               Log("BREAKEVEN SET | #" + IntegerToString(ticket) +
-                   " Sell | New SL=" + DoubleToString(newSL, _Digits));
-         }
-      }
+      else
+         Log("PARTIAL TP SKIP | min-lot position, cannot split | #" + IntegerToString(ticket));
+
+      // --- Always: move SL to BE and set TP to 3R for the remaining position ---
+      double newSL = NormalizeDouble(isBuy ? entry + buffer : entry - buffer, _Digits);
+      double tp3R  = NormalizeDouble(isBuy ? entry + 3.0 * initialRisk
+                                           : entry - 3.0 * initialRisk, _Digits);
+      if(g_trade.PositionModify(ticket, newSL, tp3R))
+         Log("BE + 3R TP SET | #" + IntegerToString(ticket) +
+             " SL=" + DoubleToString(newSL, _Digits) +
+             " TP=" + DoubleToString(tp3R, _Digits));
+      else
+         Log("MODIFY FAILED | #" + IntegerToString(ticket) +
+             " RC=" + IntegerToString(g_trade.ResultRetcode()));
    }
 }
 
