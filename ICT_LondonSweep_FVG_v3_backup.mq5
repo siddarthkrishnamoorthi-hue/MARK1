@@ -59,19 +59,19 @@ input double InpOBProximityPips        = 10.0;  // Max distance from OB zone
 input int    InpOBMaxAgeHours          = 24;    // Discard OBs older than N hours
 
 input group "=== Order Settings ==="
-input int    InpOrderExpiryBars        = 10;    // Expire pending order after N bars
+input int    InpOrderExpiryBars        = 40;    // Expire pending order after N bars
 input int    InpMagicNumber            = 202601;
 
 input group "=== Strong Displacement Filter ==="
-input int    InpMinDisplacementBodyPct = 60;    // Min body as % of bar range  [Phase 2: raise to 70]
-input int    InpMinDisplacementPips    = 6;     // Min body size in pips  [Phase 2: raise to 8]
+input int    InpMinDisplacementBodyPct = 75;    // Min body as % of bar range
+input int    InpMinDisplacementPips    = 10;    // Min body size in pips
 
 input group "=== FVG Settings ==="
 input int    InpFVGScanBars            = 5;     // Rolling window bars to search for FVG after sweep
-input int    InpMinFVGPips             = 3;     // Minimum FVG gap in pips  [Phase 2: raise to 5]
+input int    InpMinFVGPips             = 6;     // Minimum FVG gap in pips
 
 input group "=== D1 Trend Filter ==="
-input bool   InpEnableTrendFilter      = false; // Gate entries to D1 200 EMA direction  [Phase 2: enable]
+input bool   InpEnableTrendFilter      = true;  // Gate entries to D1 200 EMA direction
 
 input group "=== Daily Loss Circuit Breaker ==="
 input double InpDailyLossLimitPct      = 1.5;   // Daily equity drawdown % to halt
@@ -118,6 +118,7 @@ double   g_pipSize          = 0.0;
 datetime g_lastBarTime      = 0;
 
 int      g_ema200Handle       = INVALID_HANDLE;
+int      g_atrHandle          = INVALID_HANDLE;
 
 double   g_dailyStartBalance  = 0.0;
 bool     g_dailyLimitHit      = false;
@@ -170,6 +171,10 @@ int OnInit()
    if(g_ema200Handle == INVALID_HANDLE)
       Print("[ICT-EA] WARNING: Failed to create D1 EMA200 handle. Trend filter will pass-through.");
 
+   g_atrHandle = iATR(_Symbol, Period(), 14);
+   if(g_atrHandle == INVALID_HANDLE)
+      Print("[ICT-EA] WARNING: Failed to create ATR(14) handle. Adaptive SL will use base value.");
+
    g_dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_lastResetDay      = TimeCurrent();
    g_dailyLimitHit     = false;
@@ -178,6 +183,13 @@ int OnInit()
        " Risk=" + DoubleToString(InpRiskPercent, 1) + "%" +
        " TrendFilter=" + (InpEnableTrendFilter ? "ON" : "OFF") +
        " DailyLimit=" + DoubleToString(InpDailyLossLimitPct, 1) + "%");
+
+   Print("[ICT-EA] PARAMS | ExpiryBars=", InpOrderExpiryBars,
+         " | MinBodyPct=", InpMinDisplacementBodyPct, "%",
+         " | MinDisplPips=", InpMinDisplacementPips,
+         " | MinFVGPips=", InpMinFVGPips,
+         " | TrendFilter=", (InpEnableTrendFilter ? "ON" : "OFF"),
+         " | RiskPct=", InpRiskPercent);
 
    return INIT_SUCCEEDED;
 }
@@ -191,6 +203,11 @@ void OnDeinit(const int reason)
    {
       IndicatorRelease(g_ema200Handle);
       g_ema200Handle = INVALID_HANDLE;
+   }
+   if(g_atrHandle != INVALID_HANDLE)
+   {
+      IndicatorRelease(g_atrHandle);
+      g_atrHandle = INVALID_HANDLE;
    }
    Log("EA Deinitialised. Reason=" + IntegerToString(reason));
 }
@@ -269,6 +286,12 @@ void OnTick()
    if(InpEnableNewsFilter && IsNewsTime(gmtTime))
    {
       Log("NEWS FILTER: halted.");
+      return;
+   }
+
+   if(IsLowLiquidityPeriod(gmtDt))
+   {
+      Log("LOW LIQUIDITY: halted.");
       return;
    }
 
@@ -361,10 +384,19 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
             g_fvgLow  = high_n2;
 
             if(!IsStrongDisplacement(offset + 1, true))
+            {
+               Log("FVG REJECTED [off=" + IntegerToString(offset) + "] | Weak displacement | "
+                   "BodyPct check or Pip check failed");
                continue;
+            }
             double fvgRange = g_fvgHigh - g_fvgLow;
             if(fvgRange < InpMinFVGPips * g_pipSize)
+            {
+               Log("FVG REJECTED [off=" + IntegerToString(offset) + "] | Too small | Size=" +
+                   DoubleToString(fvgRange / g_pipSize, 1) + "p < " +
+                   IntegerToString(InpMinFVGPips) + "p minimum");
                continue;
+            }
             g_fvgMid    = g_fvgHigh - fvgRange * 0.25;
             g_fvgFormed = true;
             fvgFound    = true;
@@ -383,10 +415,19 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
             g_fvgLow  = high_n;
 
             if(!IsStrongDisplacement(offset + 1, false))
+            {
+               Log("FVG REJECTED [off=" + IntegerToString(offset) + "] | Weak displacement | "
+                   "BodyPct check or Pip check failed");
                continue;
+            }
             double fvgRange = g_fvgHigh - g_fvgLow;
             if(fvgRange < InpMinFVGPips * g_pipSize)
+            {
+               Log("FVG REJECTED [off=" + IntegerToString(offset) + "] | Too small | Size=" +
+                   DoubleToString(fvgRange / g_pipSize, 1) + "p < " +
+                   IntegerToString(InpMinFVGPips) + "p minimum");
                continue;
+            }
             g_fvgMid    = g_fvgLow + fvgRange * 0.25;
             g_fvgFormed = true;
             fvgFound    = true;
@@ -417,6 +458,65 @@ void ScanForFVGAndEnter(bool isSilverBullet = false)
          Log("FVG SCAN: no valid FVG yet in " + IntegerToString(InpFVGScanBars - 2) +
              "-bar window — will retry next bar.");
    }
+}
+
+//+------------------------------------------------------------------+
+//| CalculateAdaptiveSL                                              |
+//|  Returns the stop-loss distance in price units, widened when     |
+//|  ATR(14) exceeds 15 pips to account for elevated volatility.     |
+//+------------------------------------------------------------------+
+double CalculateAdaptiveSL(bool isBullish, double sweepExtreme, bool isSilverBullet)
+{
+   double baseSL = isSilverBullet ? InpSilverBulletSLPips : InpSLPips;
+
+   if(g_atrHandle != INVALID_HANDLE)
+   {
+      double atrBuffer[1];
+      if(CopyBuffer(g_atrHandle, 0, 0, 1, atrBuffer) > 0 && g_pipSize > 0.0)
+      {
+         double atrPips = atrBuffer[0] / g_pipSize;
+         if(atrPips > 15.0)
+            baseSL *= (1.0 + (atrPips - 15.0) / 30.0); // Scale up in high volatility
+      }
+   }
+
+   Log("AdaptiveSL: base=" + DoubleToString(isSilverBullet ? InpSilverBulletSLPips : InpSLPips, 1) +
+       "p -> adjusted=" + DoubleToString(baseSL, 1) + "p");
+   return baseSL * g_pipSize;
+}
+
+//+------------------------------------------------------------------+
+//| IsH1StructureAligned                                             |
+//|  Bullish: last completed H1 bar made a higher low than the prior |
+//|  Bearish: last completed H1 bar made a lower high than the prior |
+//+------------------------------------------------------------------+
+bool IsH1StructureAligned(bool setupBullish)
+{
+   if(Bars(_Symbol, PERIOD_H1) < 10) return true; // Pass if insufficient data
+
+   double h1_high_recent = iHigh(_Symbol, PERIOD_H1, 1);
+   double h1_low_recent  = iLow(_Symbol,  PERIOD_H1, 1);
+   double h1_high_prev   = iHigh(_Symbol, PERIOD_H1, 2);
+   double h1_low_prev    = iLow(_Symbol,  PERIOD_H1, 2);
+
+   if(setupBullish)
+      return (h1_low_recent > h1_low_prev);   // Bullish: higher lows
+   return (h1_high_recent < h1_high_prev);    // Bearish: lower highs
+}
+
+//+------------------------------------------------------------------+
+//| IsLowLiquidityPeriod                                             |
+//|  Returns true during known low-liquidity windows:                |
+//|   - Friday >= 15:00 GMT                                          |
+//|   - Sunday                                                       |
+//|   - NY close to Tokyo open (22:00-00:59 GMT)                     |
+//+------------------------------------------------------------------+
+bool IsLowLiquidityPeriod(const MqlDateTime &dt)
+{
+   if(dt.day_of_week == 5 && dt.hour >= 15) return true; // Friday close
+   if(dt.day_of_week == 0) return true;                   // Sunday
+   if(dt.hour >= 22 || dt.hour < 1) return true;          // Dead zone
+   return false;
 }
 
 //+------------------------------------------------------------------+
@@ -475,8 +575,12 @@ void PlaceLimitOrder(bool isSilverBullet = false)
       Log("TREND FILTER: Setup rejected — price against D1 EMA200 direction.");
       g_setupConsumed = true; return;
    }
-   double slPips = isSilverBullet ? InpSilverBulletSLPips : InpSLPips;
-   double slDistance = slPips * g_pipSize;
+   if(!IsH1StructureAligned(g_sweepBullish))
+   {
+      Log("H1 STRUCTURE: Setup rejected — H1 market structure misaligned.");
+      g_setupConsumed = true; return;
+   }
+   double slDistance = CalculateAdaptiveSL(g_sweepBullish, g_sweepExtreme, isSilverBullet);
 
    double ask = SymbolInfoDouble(Symbol(), SYMBOL_ASK);
    double bid = SymbolInfoDouble(Symbol(), SYMBOL_BID);
@@ -744,6 +848,12 @@ double CalculateLotSize(double slPriceDistance)
 {
    double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    double riskAmount     = accountBalance * (InpRiskPercent / 100.0);
+
+   // Safety cap: never risk more than 2% of balance regardless of InpRiskPercent
+   double maxRiskAmount = accountBalance * 0.02;
+   if(riskAmount > maxRiskAmount)
+      riskAmount = maxRiskAmount;
+
    double pipValue       = SymbolInfoDouble(Symbol(), SYMBOL_TRADE_TICK_VALUE);
 
    if(g_pipSize <= 0 || pipValue <= 0 || slPriceDistance <= 0)
@@ -1048,21 +1158,22 @@ bool IsTrendAligned(bool isBullishSetup)
    if(g_ema200Handle == INVALID_HANDLE) return true;
 
    double emaBuffer[1];
-   if(CopyBuffer(g_ema200Handle, 0, 1, 1, emaBuffer) < 1)
+   if(CopyBuffer(g_ema200Handle, 0, 0, 1, emaBuffer) < 1)
    {
-      Log("IsTrendAligned: CopyBuffer failed — passing through.");
+      Log("TREND FILTER: Failed to read EMA200, passing through.");
       return true;
    }
 
-   double ema200  = emaBuffer[0];
-   double d1Close = iClose(_Symbol, PERIOD_D1, 1);
+   double ema200       = emaBuffer[0];
+   double currentPrice = (SymbolInfoDouble(_Symbol, SYMBOL_BID) +
+                          SymbolInfoDouble(_Symbol, SYMBOL_ASK)) / 2.0;
 
-   Log("TrendFilter: D1Close=" + DoubleToString(d1Close, _Digits) +
+   Log("TrendFilter: Price=" + DoubleToString(currentPrice, _Digits) +
        " EMA200=" + DoubleToString(ema200, _Digits) +
        " Setup=" + (isBullishSetup ? "BUY" : "SELL"));
 
-   if(isBullishSetup)  return (d1Close > ema200);
-   else                return (d1Close < ema200);
+   if(isBullishSetup)  return (currentPrice > ema200); // Buy only above EMA200
+   else                return (currentPrice < ema200); // Sell only below EMA200
 }
 
 //+------------------------------------------------------------------+
