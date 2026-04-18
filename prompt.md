@@ -1,140 +1,26 @@
-CHANGES NEEDED FOR PF 1.88 BASELINE
-1. INPUT PARAMETERS (lines 27-66):
-mql5// CHANGE:
-input double InpRiskPercent = 0.1;   // Was 0.5
-input double InpRRRatio = 3.0;       // Was 2.5
-input double InpSLPips = 30.0;       // Was 25.0
-input int InpOrderExpiryBars = 10;   // Was 60
-input int InpMinDisplacementBodyPct = 60;  // Was 65
-input int InpMinDisplacementPips = 6;      // Was 8
-input int InpMinFVGPips = 3;               // Was 4
-input bool InpEnableTrendFilter = false;   // Was true
-2. FVG ENTRY LOGIC (lines 422-424 and 453-455):
-DELETE this adaptive logic:
-mql5// DELETE lines 422-424:
-double entryDepth = 0.5;
-if(fvgRange > 8.0 * g_pipSize)       entryDepth = 0.382;
-else if(fvgRange < 5.0 * g_pipSize)  entryDepth = 0.618;
-g_fvgMid = g_fvgHigh - fvgRange * entryDepth;
+The six bugs ranked by damage
+Bug 1 — H4 BOS kills all buy trades (most damaging)
+IsH4BullishBOS() requires the most recent H4 swing high to be higher than the previous one. EURUSD spent much of 2024–2026 in a broad downtrend or range, so H4 was never printing clean higher-highs during London session. Every single bullish Judas setup got rejected here. This is why you have 0 buy trades. The filter is conceptually correct — you want directional bias alignment — but it's too tightly coupled to the macro trend rather than the local session structure.
+Bug 2 — FVG scan looks at only 3 bars (45 minutes on M15)
+This is the single biggest trade-killer. ScanForFVGAndEnter() checks high[1] vs high[3] and low[1] vs low[3] — literally only the last three candles. After a Judas sweep, price usually needs 5–15 bars to print the impulse move that creates the FVG. By the time the gap is obvious and clean, it's already 45–120 minutes old and your function can't see it. You're missing probably 80%+ of valid FVG setups just from this.
+Bug 3 — g_setupConsumed prevents all same-day retries
+Every filter rejection — H4, premium/discount, news, price check — immediately sets g_setupConsumed = true. So if H4 BOS rejects a 9:00 AM setup, the EA is completely blind for the rest of the day even if a perfect FVG prints at 2:00 PM in NY session with ideal structure. This flag should only be set when you actually place an order or make a deliberate "skip this entire day" decision. Remove it from all filter-rejection return paths.
+Bug 4 — Kill zone gate closes before FVG can form
+The OnTick() gate if(!(inLondon || inNY || inSilverBullet)) return exits early between sessions. A London sweep at 10:45 AM followed by an FVG forming at 11:15 AM (just outside the London window) never gets caught. ICT setups don't care about session boundaries after the sweep is established — the FVG is valid until price trades through it from the other side.
+Bug 5 — Silver Bullet is conceptually misimplemented
+The Silver Bullet at 15:00–16:00 GMT currently calls DetectJudasSwing() and compares against the 8-hour-old Asian range. That's not what Silver Bullet is. Correctly, SB should identify a fresh local liquidity pool from the NY morning (13:00–15:00 GMT), watch for a sweep of that pool in the 15:00–16:00 window, then look for an FVG in the 1-hour move. Trade 1 happened to work because price re-swept the Asian range at that time, but this is coincidental.
+Bug 6 — Order expiry + SL too tight
+10 bars = 150 minutes on M15. A London sweep order placed at 10:00 AM expires by 12:30 PM and never sees the NY open retracement. Set InpOrderExpiryBars = 25–30. The 20-pip SL is also tight for EURUSD — common wick extensions on M15 are 25–35 pips, so you'd get stopped before entry on fast days.
 
-// DELETE lines 453-455:
-double entryDepth = 0.5;
-if(fvgRange > 8.0 * g_pipSize)       entryDepth = 0.382;
-else if(fvgRange < 5.0 * g_pipSize)  entryDepth = 0.618;
-g_fvgMid = g_fvgLow + fvgRange * entryDepth;
-REPLACE with simple midpoint:
-mql5// Line 425 (bullish):
-g_fvgMid = (g_fvgHigh + g_fvgLow) / 2.0;
+The fix sequence
+Do this first (trade frequency):
 
-// Line 456 (bearish):
-g_fvgMid = (g_fvgHigh + g_fvgLow) / 2.0;
-3. DISABLE NEW FILTERS in PlaceLimitOrder() (lines 555-571):
-COMMENT OUT or DELETE:
-mql5// DELETE lines 555-559:
-if(!HasMomentumAlignment(g_sweepBullish))
-{
-   Log("MOMENTUM: Setup rejected, recent bars against direction.");
-   g_setupConsumed = true; return;
-}
+In ScanForFVGAndEnter(), replace the single bar[1]/bar[3] check with a loop from i=1 to i=13, checking high[i+2] < low[i] (bullish FVG) or low[i+2] > high[i] (bearish FVG). Take the most recently formed gap.
+Remove g_setupConsumed = true from all filter rejection return statements. Add a g_lastRejectBar datetime guard to prevent re-firing on the same bar.
+Set InpEnableH4Filter = false temporarily. Run the backtest — you'll see how many setups now appear without it. Then replace it with a simpler iClose(PERIOD_H4, 1) > iMA(PERIOD_H4, 50) check instead of the swing-structure BOS.
+Set InpOrderExpiryBars = 25 and InpSLPips = 25.
 
-// DELETE lines 566-571:
-if(!IsH1StructureAligned(g_sweepBullish))
-{
-   Log("H1 STRUCTURE: Setup rejected — H1 market structure misaligned.");
-   g_setupConsumed = true; return;
-}
-4. DISABLE LOW LIQUIDITY FILTER (lines 320-325):
-COMMENT OUT:
-mql5// DELETE lines 320-325:
-if(IsLowLiquidityPeriod(gmtDt))
-{
-   Log("LOW LIQUIDITY: halted.");
-   return;
-}
-5. DISABLE ADAPTIVE SL (line 572):
-REPLACE:
-mql5// Line 572 - REPLACE:
-double slDistance = CalculateAdaptiveSL(g_sweepBullish, g_sweepExtreme, isSilverBullet);
-
-// WITH:
-double slPips = isSilverBullet ? InpSilverBulletSLPips : InpSLPips;
-double slDistance = slPips * g_pipSize;
-6. DISABLE MARKET ENTRY FALLBACK (lines 597-622):
-DELETE entire block starting at line 597 (the priceInZone logic).
-
-After applying all changes:
-
-Ensure code compiles without errors
-Ensure no unused variables like entryDepth remain
-Ensure no duplicate input parameters exist
-Ensure all logic flows correctly without early unintended returns
-
-GOAL
-
-These changes are intended to:
-
-Improve trade quality
-
-Replace Midpoint with OTE Entry (BIGGEST EDGE)
-
-Midpoint is safe—but OTE (62%–79%, ideally 70.5%) is where ICT edge actually lives.
-Avoids shallow retracements
-
-Fix FVG Timing. Even though you partially fixed it, it’s still fragile.
-Upgrade to:
-Allow multi-bar FVG formation window AFTER sweep
-Modify logic:
-After sweep:
-Keep scanning for FVG for next N bars
-Only kill setup AFTER timeout
-
-Add HTF Bias (REAL FILTER, NOT EMA)
-
-Your EMA filter was actually hurting performance.
-
-❌ Problem:
-
-EMA = lagging → kills good reversals
-
-✅ Replace with simple D1 candle bias:
-
-Add “Displacement Quality Score” (SMART FILTER)
-
-Right now displacement is binary → weak.
-
-✅ Upgrade:
-
-Instead of just pass/fail, score it
-Remove over-filtering
-Prevent late market entries
-Stabilize risk model
-
-mprove Risk Model (THIS BOOSTS PF DIRECTLY)
-Current:
-
-Fixed RR = 3.0
-
-Upgrade:
-
-Dynamic RR based on volatility:
-
-double rr = 2.0;
-
-if(fvgRange > 8 * g_pipSize)
-   rr = 3.0;
-else if(fvgRange < 4 * g_pipSize)
-   rr = 2.0;
-8. 🛑 Add Partial TP (HUGE PF BOOST)
-
-Instead of full TP:
-
-Close 50% at 1R
-Let rest run to 3R
-
-✅ Remove market entry fallback (you already did)
-🔥 Add OTE entry (BIGGEST WIN)
-⏱️ Fix FVG retry logic
-🧠 Add D1 bias
-🎯 Improve displacement filter
-
-Do not add new features. Only modify as instructed.
+5. After g_sweepDetected = true, allow ScanForFVGAndEnter() to keep running until 21:00 GMT regardless of inLondon/inNY flags.
+6. Rewrite Silver Bullet as a separate state machine: collect local NY morning range (13:00–15:00 GMT), detect sweep in SB window, scan for FVG in that window's bars.
+7. Enable InpEnablePDFilter and InpEnableWeeklyBias — these are already correctly coded, they just need to be switched on once your trade frequency is healthy.
+8. Add a full AMD (Accumulation–Manipulation–Distribution) model for the NY session with its own sweep detection separate from the London Judas logic.
