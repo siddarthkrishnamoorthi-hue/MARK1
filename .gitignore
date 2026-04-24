@@ -1,0 +1,38 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Python distribution
+*.egg-info/
+dist/
+build/
+*.egg
+
+# MQL5 compiled binaries
+*.ex5
+
+# Generated output files
+MARK1_EquityCurve.png
+MARK1_ModelWinRate.png
+MARK1_OptReport.csv
+IPDA_Levels.png
+SMT_Chart.png
+MARK1_Trades.csv
+
+# IDE / editor
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
