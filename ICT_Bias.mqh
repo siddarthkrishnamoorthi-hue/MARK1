@@ -1,10 +1,13 @@
 //+------------------------------------------------------------------+
-//| ICT_Bias.mqh                                                     |
-//| Daily bias, HTF consensus, PO3 phase, and premium/discount       |
+//| ICT_Bias.mqh                                                      |
+//| MARK1 ICT Expert Advisor — Daily bias, HTF consensus, DOW phase  |
+//| Copyright 2024-2025, MARK1 Project                               |
 //+------------------------------------------------------------------+
+#pragma once
 #ifndef __ICT_BIAS_MQH__
 #define __ICT_BIAS_MQH__
 
+#include "ICT_Constants.mqh"
 #include "ICT_Structure.mqh"
 #include "ICT_Session.mqh"
 
@@ -23,6 +26,17 @@ enum ENUM_ICT_PDA_ZONE
    ICT_PDA_EQUILIBRIUM
 };
 
+/// @brief ICT Day-of-Week phase for trade quality gating.
+enum ENUM_DOW_PHASE
+{
+   DOW_MONDAY,     ///< Accumulation — wait for direction
+   DOW_TUESDAY,    ///< Optimal — trend continuation setups
+   DOW_WEDNESDAY,  ///< Optimal — highest probability continuation
+   DOW_THURSDAY,   ///< Distribution — tighten targets
+   DOW_FRIDAY,     ///< Reversal risk — TGIF potential, reduce risk
+   DOW_WEEKEND     ///< No trading
+};
+
 struct ICTBiasSnapshot
 {
    bool                  valid;
@@ -32,7 +46,10 @@ struct ICTBiasSnapshot
    ENUM_ICT_SESSION_BIAS trendBias;
    ENUM_ICT_SESSION_BIAS directionBias;
    ENUM_ICT_SESSION_BIAS consensusBias;
+   ENUM_ICT_SESSION_BIAS weeklyBias;    ///< Phase 2: W1 directional bias
+   ENUM_ICT_SESSION_BIAS monthlyBias;   ///< Phase 2: MN1 directional bias
    ENUM_ICT_PDA_ZONE     pdaZone;
+   ENUM_DOW_PHASE        currentDOWPhase; ///< Phase 4: ICT day-of-week phase
    double                rangeHigh;
    double                rangeLow;
    double                equilibrium;
@@ -80,6 +97,8 @@ private:
 
    ENUM_ICT_SESSION_BIAS ResolveFromStructure(const ICTStructureSnapshot &snapshot) const;
    ENUM_ICT_SESSION_BIAS ResolveDailyBias() const;
+   ENUM_ICT_SESSION_BIAS ResolveWeeklyBias() const;
+   ENUM_ICT_SESSION_BIAS ResolveMonthlyBias() const;
    ENUM_ICT_PDA_ZONE ResolvePDAZone(const double price,
                                     double &rangeHigh,
                                     double &rangeLow,
@@ -227,15 +246,27 @@ bool CICTBiasEngine::Refresh(const ICTSessionSnapshot &session)
    m_snapshot.trendBias     = ResolveFromStructure(trendSnapshot);
    m_snapshot.directionBias = ResolveFromStructure(directionSnapshot);
 
-   if(m_snapshot.dailyBias != ICT_SESSION_BIAS_NEUTRAL &&
-      m_snapshot.dailyBias == m_snapshot.trendBias)
+   // BUG FIX: 3-TF consensus (Daily + H4 + H1 — previously only Daily + H4)
    {
-      m_snapshot.consensusBias = m_snapshot.dailyBias;
+      int bullVotes = 0, bearVotes = 0;
+      if(m_snapshot.dailyBias     == ICT_SESSION_BIAS_LONG_ONLY)  bullVotes++;
+      else if(m_snapshot.dailyBias  == ICT_SESSION_BIAS_SHORT_ONLY) bearVotes++;
+      if(m_snapshot.trendBias     == ICT_SESSION_BIAS_LONG_ONLY)  bullVotes++;
+      else if(m_snapshot.trendBias  == ICT_SESSION_BIAS_SHORT_ONLY) bearVotes++;
+      if(m_snapshot.directionBias == ICT_SESSION_BIAS_LONG_ONLY)  bullVotes++;
+      else if(m_snapshot.directionBias == ICT_SESSION_BIAS_SHORT_ONLY) bearVotes++;
+
+      if(bullVotes >= 2)      m_snapshot.consensusBias = ICT_SESSION_BIAS_LONG_ONLY;
+      else if(bearVotes >= 2) m_snapshot.consensusBias = ICT_SESSION_BIAS_SHORT_ONLY;
+      else                    m_snapshot.consensusBias = ICT_SESSION_BIAS_NEUTRAL;
    }
-   else
-   {
-      m_snapshot.consensusBias = ICT_SESSION_BIAS_NEUTRAL;
-   }
+
+   // Phase 2: weekly and monthly bias (informational — gating in Phase 5)
+   m_snapshot.weeklyBias  = ResolveWeeklyBias();
+   m_snapshot.monthlyBias = ResolveMonthlyBias();
+
+   // Phase 4: DOW phase
+   m_snapshot.currentDOWPhase = GetDOWPhase(session.gmtTime);
 
    double bidPrice = SymbolInfoDouble(m_symbol, SYMBOL_BID);
    m_snapshot.pdaZone = ResolvePDAZone(bidPrice,
@@ -263,6 +294,40 @@ ICTBiasSnapshot CICTBiasEngine::Snapshot() const
 bool CICTBiasEngine::AllowsTrade(const bool bullish) const
 {
    return bullish ? m_snapshot.longAllowed : m_snapshot.shortAllowed;
+}
+
+/// @brief Resolves weekly directional bias from PERIOD_W1 structure.
+ENUM_ICT_SESSION_BIAS CICTBiasEngine::ResolveWeeklyBias() const
+{
+   double wClose = iClose(m_symbol, PERIOD_W1, 1);
+   double wOpen  = iOpen (m_symbol, PERIOD_W1, 1);
+   if(wClose <= 0.0 || wOpen <= 0.0) return ICT_SESSION_BIAS_NEUTRAL;
+   return (wClose > wOpen) ? ICT_SESSION_BIAS_LONG_ONLY : ICT_SESSION_BIAS_SHORT_ONLY;
+}
+
+/// @brief Resolves monthly directional bias from PERIOD_MN1 structure.
+ENUM_ICT_SESSION_BIAS CICTBiasEngine::ResolveMonthlyBias() const
+{
+   double mClose = iClose(m_symbol, PERIOD_MN1, 1);
+   double mOpen  = iOpen (m_symbol, PERIOD_MN1, 1);
+   if(mClose <= 0.0 || mOpen <= 0.0) return ICT_SESSION_BIAS_NEUTRAL;
+   return (mClose > mOpen) ? ICT_SESSION_BIAS_LONG_ONLY : ICT_SESSION_BIAS_SHORT_ONLY;
+}
+
+/// @brief Returns the ICT-mapped DOW phase for a given GMT timestamp.
+ENUM_DOW_PHASE GetDOWPhase(const datetime gmtTime)
+{
+   MqlDateTime dt;
+   TimeToStruct(gmtTime, dt);
+   switch(dt.day_of_week)
+   {
+      case 1: return DOW_MONDAY;
+      case 2: return DOW_TUESDAY;
+      case 3: return DOW_WEDNESDAY;
+      case 4: return DOW_THURSDAY;
+      case 5: return DOW_FRIDAY;
+      default: return DOW_WEEKEND;
+   }
 }
 
 #endif // __ICT_BIAS_MQH__

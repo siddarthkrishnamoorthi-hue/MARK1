@@ -1,9 +1,17 @@
 //+------------------------------------------------------------------+
-//| ICT_Session.mqh                                                  |
-//| Session, killzone, macro, PO3, and news-block tracking           |
+//| ICT_Session.mqh                                                   |
+//| MARK1 ICT Expert Advisor — Session, killzone, PO3, news blocking |
+//| Copyright 2024-2025, MARK1 Project                               |
 //+------------------------------------------------------------------+
+#pragma once
 #ifndef __ICT_SESSION_MQH__
 #define __ICT_SESSION_MQH__
+
+#include "ICT_Constants.mqh"
+
+/// London Close session window constants (GMT hours)
+#define LONDON_CLOSE_START_GMT  14   ///< 14:00 GMT
+#define LONDON_CLOSE_END_GMT    15   ///< 15:00 GMT
 
 enum ENUM_ICT_SESSION_WINDOW
 {
@@ -11,10 +19,45 @@ enum ENUM_ICT_SESSION_WINDOW
    ICT_SESSION_ASIAN,
    ICT_SESSION_LONDON_KZ,
    ICT_SESSION_LONDON_SB,
+   ICT_SESSION_LONDON_CLOSE,   ///< London Close window 14:00-15:00 GMT
    ICT_SESSION_NY_AM_KZ,
    ICT_SESSION_NY_SB_AM,
    ICT_SESSION_NY_SB_PM,
    ICT_SESSION_MACRO
+};
+
+/// @brief ICT Power of Three phase enumeration.
+enum ENUM_PO3_PHASE
+{
+   PO3_ACCUMULATION,   ///< Asian range building
+   PO3_MANIPULATION,   ///< Judas Swing — false move opposite true direction
+   PO3_DISTRIBUTION,   ///< True institutional delivery
+   PO3_UNKNOWN
+};
+
+/// @brief Judas Swing detection and confirmation state.
+struct SJudasSwing
+{
+   bool            detected;
+   bool            confirmed;           ///< True once reversal candle closes inside Asian range
+   ENUM_PO3_PHASE  currentPhase;
+   double          manipulationHigh;    ///< High of the false move
+   double          manipulationLow;     ///< Low of the false move
+   double          asianRangeHigh;
+   double          asianRangeLow;
+   bool            isBullishJudas;      ///< True = swept below Asian low then reversed up
+   datetime        manipulationTime;
+   datetime        confirmationTime;
+};
+
+/// @brief Opening Range Gap for a session.
+struct SSessionORG
+{
+   double            gapHigh;
+   double            gapLow;
+   bool              isBullish;
+   bool              isFilled;
+   ENUM_ICT_SESSION_WINDOW session;  ///< SESSION_LONDON_KZ or SESSION_NY_AM_KZ
 };
 
 struct ICTSessionSnapshot
@@ -25,6 +68,7 @@ struct ICTSessionSnapshot
    bool                    inAsian;
    bool                    inLondonKillzone;
    bool                    inLondonSilverBullet;
+   bool                    inLondonCloseWindow;  ///< Phase 2: 14:00-15:00 GMT
    bool                    inNYAMKillzone;
    bool                    inNYSilverBulletAM;
    bool                    inNYSilverBulletPM;
@@ -37,20 +81,23 @@ struct ICTSessionSnapshot
    double                  nyAMHigh;
    double                  nyAMLow;
    bool                    nyAMRangeReady;
+   double                  midnightOpenPrice;  ///< Phase 2: 00:00 GMT open price of current day
+   SJudasSwing             judasSM;            ///< Phase 4: Judas Swing state machine
 };
 
 string ICTSessionWindowToString(const ENUM_ICT_SESSION_WINDOW value)
 {
    switch(value)
    {
-      case ICT_SESSION_ASIAN:      return "ASIAN";
-      case ICT_SESSION_LONDON_KZ:  return "LONDON_KZ";
-      case ICT_SESSION_LONDON_SB:  return "LONDON_SB";
-      case ICT_SESSION_NY_AM_KZ:   return "NY_AM_KZ";
-      case ICT_SESSION_NY_SB_AM:   return "NY_SB_AM";
-      case ICT_SESSION_NY_SB_PM:   return "NY_SB_PM";
-      case ICT_SESSION_MACRO:      return "MACRO";
-      default:                     return "NONE";
+      case ICT_SESSION_ASIAN:         return "ASIAN";
+      case ICT_SESSION_LONDON_KZ:     return "LONDON_KZ";
+      case ICT_SESSION_LONDON_SB:     return "LONDON_SB";
+      case ICT_SESSION_LONDON_CLOSE:  return "LONDON_CLOSE";   ///< Phase 2 addition
+      case ICT_SESSION_NY_AM_KZ:      return "NY_AM_KZ";
+      case ICT_SESSION_NY_SB_AM:      return "NY_SB_AM";
+      case ICT_SESSION_NY_SB_PM:      return "NY_SB_PM";
+      case ICT_SESSION_MACRO:         return "MACRO";
+      default:                        return "NONE";
    }
 }
 
@@ -72,6 +119,7 @@ private:
    int  MinuteOfDay(const MqlDateTime &dt) const;
    void ResetForDay(const MqlDateTime &dt);
    void UpdateRangeState();
+   void UpdateJudasSwing(const datetime gmtTime, const int hour, const int minute);
    bool IsHardcodedNewsTime(const datetime gmtTime) const;
    bool IsNewsBlockedInternal(const datetime gmtTime) const;
 
@@ -221,24 +269,18 @@ bool CICTSessionEngine::IsNewsBlockedInternal(const datetime gmtTime) const
    datetime checkFrom = gmtTime - (m_newsHaltBeforeMinutes * 60);
    datetime checkTo   = gmtTime + (m_newsResumeAfterMinutes * 60);
 
+   // BUG FIX: USD and EUR calendar checks are now INDEPENDENT so a failed USD
+   // calendar call cannot prevent EUR events from being evaluated.
    MqlCalendarValue usdValues[];
-   bool calendarOk = CalendarValueHistory(usdValues, checkFrom, checkTo, "USD");
-   if(calendarOk)
+   if(CalendarValueHistory(usdValues, checkFrom, checkTo, "USD"))
    {
       for(int i = 0; i < ArraySize(usdValues); i++)
       {
          MqlCalendarEvent eventInfo;
          MqlCalendarCountry countryInfo;
-         if(!CalendarEventById(usdValues[i].event_id, eventInfo))
-            continue;
-         if(!CalendarCountryById(eventInfo.country_id, countryInfo))
-            continue;
-         if(eventInfo.importance != CALENDAR_IMPORTANCE_HIGH)
-            continue;
-
-         string currency = countryInfo.currency;
-         if(currency != "USD" && currency != "EUR")
-            continue;
+         if(!CalendarEventById(usdValues[i].event_id, eventInfo))   continue;
+         if(!CalendarCountryById(eventInfo.country_id, countryInfo)) continue;
+         if(eventInfo.importance != CALENDAR_IMPORTANCE_HIGH)        continue;
 
          datetime eventTime  = usdValues[i].time;
          datetime blockStart = eventTime - (m_newsHaltBeforeMinutes * 60);
@@ -246,30 +288,30 @@ bool CICTSessionEngine::IsNewsBlockedInternal(const datetime gmtTime) const
          if(gmtTime >= blockStart && gmtTime <= blockEnd)
             return true;
       }
+   }
 
-      MqlCalendarValue eurValues[];
-      if(CalendarValueHistory(eurValues, checkFrom, checkTo, "EUR"))
+   // EUR filter — independent check (BUG FIX: was nested inside USD calendar if-block)
+   MqlCalendarValue eurValues[];
+   if(CalendarValueHistory(eurValues, checkFrom, checkTo, "EUR"))
+   {
+      for(int i = 0; i < ArraySize(eurValues); i++)
       {
-         for(int i = 0; i < ArraySize(eurValues); i++)
-         {
-            MqlCalendarEvent eventInfo;
-            MqlCalendarCountry countryInfo;
-            if(!CalendarEventById(eurValues[i].event_id, eventInfo))
-               continue;
-            if(!CalendarCountryById(eventInfo.country_id, countryInfo))
-               continue;
-            if(eventInfo.importance != CALENDAR_IMPORTANCE_HIGH)
-               continue;
+         MqlCalendarEvent eventInfo;
+         MqlCalendarCountry countryInfo;
+         if(!CalendarEventById(eurValues[i].event_id, eventInfo))   continue;
+         if(!CalendarCountryById(eventInfo.country_id, countryInfo)) continue;
+         if(eventInfo.importance != CALENDAR_IMPORTANCE_HIGH)        continue;
 
-            datetime eventTime  = eurValues[i].time;
-            datetime blockStart = eventTime - (m_newsHaltBeforeMinutes * 60);
-            datetime blockEnd   = eventTime + (m_newsResumeAfterMinutes * 60);
-            if(gmtTime >= blockStart && gmtTime <= blockEnd)
-               return true;
+         datetime eventTime  = eurValues[i].time;
+         datetime blockStart = eventTime - (m_newsHaltBeforeMinutes * 60);
+         datetime blockEnd   = eventTime + (m_newsResumeAfterMinutes * 60);
+         if(gmtTime >= blockStart && gmtTime <= blockEnd)
+         {
+            Print("[MARK1][NEWS] EUR filter active — event blocked trading at ",
+                  TimeToString(eventTime, TIME_DATE|TIME_MINUTES));
+            return true;
          }
       }
-
-      return false;
    }
 
    return IsHardcodedNewsTime(gmtTime);
@@ -284,13 +326,22 @@ bool CICTSessionEngine::Refresh()
 
    int currentDayKey = DateToKey(gmtDt);
    if(currentDayKey != m_lastDayKey)
+   {
       ResetForDay(gmtDt);
+      // Compute Midnight Open Price (00:00 GMT candle) on new day
+      datetime midnightGMT = iTime(m_symbol, PERIOD_D1, 0);
+      int shift = iBarShift(m_symbol, m_triggerTimeframe, midnightGMT, false);
+      m_snapshot.midnightOpenPrice = (shift >= 0) ? iOpen(m_symbol, m_triggerTimeframe, shift) : 0.0;
+   }
 
    int minuteOfDay = MinuteOfDay(gmtDt);
    m_snapshot.gmtTime               = gmtTime;
    m_snapshot.inAsian               = IsWindow(minuteOfDay, 60, 300);
    m_snapshot.inLondonKillzone      = IsWindow(minuteOfDay, 420, 600);
    m_snapshot.inLondonSilverBullet  = IsWindow(minuteOfDay, 480, 540);
+   m_snapshot.inLondonCloseWindow   = IsWindow(minuteOfDay,
+                                               LONDON_CLOSE_START_GMT * 60,
+                                               LONDON_CLOSE_END_GMT   * 60);
    m_snapshot.inNYAMKillzone        = IsWindow(minuteOfDay, 720, 900);
    m_snapshot.inNYSilverBulletAM    = IsWindow(minuteOfDay, 900, 960);
    m_snapshot.inNYSilverBulletPM    = IsWindow(minuteOfDay, 1140, 1200);
@@ -310,6 +361,8 @@ bool CICTSessionEngine::Refresh()
       m_snapshot.activeWindow = ICT_SESSION_NY_SB_AM;
    else if(m_snapshot.inNYSilverBulletPM)
       m_snapshot.activeWindow = ICT_SESSION_NY_SB_PM;
+   else if(m_snapshot.inLondonCloseWindow)
+      m_snapshot.activeWindow = ICT_SESSION_LONDON_CLOSE;
    else if(m_snapshot.inLondonKillzone)
       m_snapshot.activeWindow = ICT_SESSION_LONDON_KZ;
    else if(m_snapshot.inNYAMKillzone)
@@ -326,6 +379,9 @@ bool CICTSessionEngine::Refresh()
 
    if(!m_snapshot.inNYAMKillzone && m_snapshot.nyAMHigh > 0.0 && m_snapshot.nyAMLow > 0.0)
       m_snapshot.nyAMRangeReady = true;
+
+   // Judas Swing state machine (Phase 4)
+   UpdateJudasSwing(gmtTime, gmtDt.hour, gmtDt.min);
 
    return true;
 }
@@ -350,6 +406,150 @@ bool CICTSessionEngine::IsNewsBlocked() const
 ICTSessionSnapshot CICTSessionEngine::Snapshot() const
 {
    return m_snapshot;
+}
+
+/// @brief Updates the Judas Swing state machine. Called every tick from Refresh().
+void CICTSessionEngine::UpdateJudasSwing(const datetime gmtTime, const int hour, const int minute)
+{
+   SJudasSwing &js = m_snapshot.judasSM;
+
+   // Reset Judas state when Asian range is not yet ready
+   if(!m_snapshot.asianRangeReady)
+   {
+      js.asianRangeHigh = m_snapshot.asianHigh;
+      js.asianRangeLow  = m_snapshot.asianLow;
+      js.currentPhase   = PO3_ACCUMULATION;
+      return;
+   }
+
+   // Capture Asian range boundaries once available
+   if(js.asianRangeHigh == 0.0)
+   {
+      js.asianRangeHigh = m_snapshot.asianHigh;
+      js.asianRangeLow  = m_snapshot.asianLow;
+   }
+
+   // Only evaluate Judas manipulation during London Killzone 07:00-08:30 GMT
+   int minuteOfDay = hour * 60 + minute;
+   bool inLondonManipWindow = (minuteOfDay >= 420 && minuteOfDay < 510); // 07:00-08:30
+
+   if(!inLondonManipWindow || js.confirmed)
+      return;
+
+   js.currentPhase = PO3_MANIPULATION;
+
+   double currentHigh = iHigh(m_symbol, m_triggerTimeframe, 0);
+   double currentLow  = iLow (m_symbol, m_triggerTimeframe, 0);
+
+   // Detect sweep of Asian range extremes during London manipulation window
+   if(!js.detected)
+   {
+      if(currentLow < js.asianRangeLow)
+      {
+         js.detected          = true;
+         js.isBullishJudas    = true;   // swept below → expect reversal UP
+         js.manipulationLow   = currentLow;
+         js.manipulationTime  = gmtTime;
+      }
+      else if(currentHigh > js.asianRangeHigh)
+      {
+         js.detected          = true;
+         js.isBullishJudas    = false;  // swept above → expect reversal DOWN
+         js.manipulationHigh  = currentHigh;
+         js.manipulationTime  = gmtTime;
+      }
+      return;
+   }
+
+   // Confirmation: a M15 candle closes BACK INSIDE the Asian range
+   double lastClose = iClose(m_symbol, PERIOD_M15, 1);
+   if(js.isBullishJudas)
+   {
+      if(lastClose > js.asianRangeLow)
+      {
+         js.confirmed         = true;
+         js.currentPhase      = PO3_DISTRIBUTION;
+         js.confirmationTime  = iTime(m_symbol, PERIOD_M15, 1);
+      }
+   }
+   else
+   {
+      if(lastClose < js.asianRangeHigh)
+      {
+         js.confirmed         = true;
+         js.currentPhase      = PO3_DISTRIBUTION;
+         js.confirmationTime  = iTime(m_symbol, PERIOD_M15, 1);
+      }
+   }
+}
+
+/// @brief Returns the Midnight Open Price (00:00 GMT candle open).
+double GetMidnightOpen(const string symbol, const ENUM_TIMEFRAMES tf)
+{
+   datetime midnightGMT = iTime(symbol, PERIOD_D1, 0);
+   int shift = iBarShift(symbol, tf, midnightGMT, false);
+   if(shift < 0) return 0.0;
+   return iOpen(symbol, tf, shift);
+}
+
+/// @brief Returns true if gmtTime falls within the London Close window.
+bool IsLondonCloseWindow(const datetime gmtTime)
+{
+   MqlDateTime dt;
+   TimeToStruct(gmtTime, dt);
+   return (dt.hour >= LONDON_CLOSE_START_GMT && dt.hour < LONDON_CLOSE_END_GMT);
+}
+
+/// @brief Computes the London session Opening Range Gap (last M15 close before 07:00 vs first open at 07:00).
+SSessionORG ComputeLondonORG(const string symbol)
+{
+   SSessionORG org;
+   ZeroMemory(org);
+   org.session = ICT_SESSION_LONDON_KZ;
+
+   // Find the M15 bar that opens at 07:00 GMT
+   datetime londonOpen = iTime(symbol, PERIOD_D1, 0)
+                         + (datetime)(7 * 3600);  // 07:00 GMT of current day
+   int openShift  = iBarShift(symbol, PERIOD_M15, londonOpen, false);
+   if(openShift < 0) return org;
+
+   double openPrice  = iOpen (symbol, PERIOD_M15, openShift);
+   double prevClose  = iClose(symbol, PERIOD_M15, openShift + 1);
+   if(openPrice <= 0.0 || prevClose <= 0.0) return org;
+
+   org.isBullish = (openPrice > prevClose);
+   org.gapHigh   = MathMax(openPrice, prevClose);
+   org.gapLow    = MathMin(openPrice, prevClose);
+
+   // Mark filled if current price has crossed both boundaries
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   org.isFilled = (org.isBullish ? bid <= org.gapLow : bid >= org.gapHigh);
+   return org;
+}
+
+/// @brief Computes the NY AM session Opening Range Gap (last M15 close before 12:00 vs first open at 12:00).
+SSessionORG ComputeNYORG(const string symbol)
+{
+   SSessionORG org;
+   ZeroMemory(org);
+   org.session = ICT_SESSION_NY_AM_KZ;
+
+   datetime nyOpen   = iTime(symbol, PERIOD_D1, 0)
+                       + (datetime)(12 * 3600);  // 12:00 GMT
+   int openShift  = iBarShift(symbol, PERIOD_M15, nyOpen, false);
+   if(openShift < 0) return org;
+
+   double openPrice  = iOpen (symbol, PERIOD_M15, openShift);
+   double prevClose  = iClose(symbol, PERIOD_M15, openShift + 1);
+   if(openPrice <= 0.0 || prevClose <= 0.0) return org;
+
+   org.isBullish = (openPrice > prevClose);
+   org.gapHigh   = MathMax(openPrice, prevClose);
+   org.gapLow    = MathMin(openPrice, prevClose);
+
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   org.isFilled = (org.isBullish ? bid <= org.gapLow : bid >= org.gapHigh);
+   return org;
 }
 
 #endif // __ICT_SESSION_MQH__

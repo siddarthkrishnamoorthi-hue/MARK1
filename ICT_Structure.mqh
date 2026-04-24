@@ -1,9 +1,13 @@
 //+------------------------------------------------------------------+
-//| ICT_Structure.mqh                                                |
-//| Multi-timeframe swing, BOS, CHoCH, and MSS detection engine      |
+//| ICT_Structure.mqh                                                 |
+//| MARK1 ICT Expert Advisor — Multi-timeframe swing/BOS/CHoCH/MSS  |
+//| Copyright 2024-2025, MARK1 Project                               |
 //+------------------------------------------------------------------+
+#pragma once
 #ifndef __ICT_STRUCTURE_MQH__
 #define __ICT_STRUCTURE_MQH__
+
+#include "ICT_Constants.mqh"
 
 enum ENUM_ICT_SWING_CLASSIFICATION
 {
@@ -214,7 +218,8 @@ bool CICTStructureEngine::IsSwingHigh(const int index) const
 
    for(int step = 1; step <= m_swingStrength; step++)
    {
-      if(m_rates[index].high <= m_rates[index + step].high)
+      // Allow equal highs on older bars (right side) — BUG FIX: was <= which rejected equal highs
+      if(m_rates[index].high < m_rates[index + step].high)
          return false;
       if(m_rates[index].high < m_rates[index - step].high)
          return false;
@@ -230,7 +235,8 @@ bool CICTStructureEngine::IsSwingLow(const int index) const
 
    for(int step = 1; step <= m_swingStrength; step++)
    {
-      if(m_rates[index].low >= m_rates[index + step].low)
+      // Allow equal lows on older bars (right side) — BUG FIX: was >= which rejected equal lows
+      if(m_rates[index].low > m_rates[index + step].low)
          return false;
       if(m_rates[index].low > m_rates[index - step].low)
          return false;

@@ -1,12 +1,21 @@
 //+------------------------------------------------------------------+
-//| ICT_RiskManager.mqh                                              |
-//| Fixed-risk sizing, funded-account limits, pending-order control  |
+//| ICT_RiskManager.mqh                                               |
+//| MARK1 ICT Expert Advisor — Risk sizing, drawdown, trade control  |
+//| Copyright 2024-2025, MARK1 Project                               |
 //+------------------------------------------------------------------+
+#pragma once
 #ifndef __ICT_RISKMANAGER_MQH__
 #define __ICT_RISKMANAGER_MQH__
 
 #include <Trade\Trade.mqh>
+#include "ICT_Constants.mqh"
 #include "ICT_Structure.mqh"
+#include "ICT_Bias.mqh"   ///< Required for ENUM_ICT_SESSION_BIAS in STradeRecord
+
+/// TP partial close ratios — must sum to 1.0 per ICT specification.
+static const double TP1_RATIO = 0.35;  ///< Close 35% at TP1
+static const double TP2_RATIO = 0.40;  ///< Close 40% at TP2
+static const double TP3_RATIO = 0.25;  ///< Trailing remainder 25% to TP3
 
 struct ICTRiskSnapshot
 {
@@ -19,6 +28,31 @@ struct ICTRiskSnapshot
    double   weeklyDrawdownPct;
    bool     dailyBlocked;
    bool     weeklyBlocked;
+};
+
+/// @brief Complete trade record for CSV logging (Phase 6).
+struct STradeRecord
+{
+   ulong    id;
+   datetime openTime;
+   datetime closeTime;
+   ENUM_ORDER_TYPE type;
+   double   entryPrice;
+   double   slPrice;
+   double   tp1;
+   double   tp2;
+   double   tp3;
+   double   closePrice;
+   double   lotSize;
+   double   pnlPips;
+   double   pnlDollars;
+   string   modelName;
+   ENUM_ICT_SESSION_BIAS biasAtEntry; ///< Bias at trade entry (Phase 6 CSV logging)
+   string   dowPhase;
+   string   session;
+   bool     idmSwept;
+   string   fvgType;
+   string   obType;
 };
 
 struct ICTPendingTargetState
@@ -60,6 +94,9 @@ private:
    ENUM_TIMEFRAMES          m_triggerTimeframe;
    double                   m_pointSize;
    double                   m_pipSize;
+   double                   m_maxSpreadPips;         ///< Phase 6: max allowed spread
+   int                      m_maxConsecutiveLosses;  ///< Phase 6: circuit breaker threshold
+   int                      m_consecutiveLosses;     ///< Phase 6: current streak
    ICTRiskSnapshot          m_snapshot;
    ICTPendingTargetState    m_pendingStates[];
    ICTPositionTargetState   m_positionStates[];
@@ -116,6 +153,14 @@ public:
    void ManageOpenPositions(CTrade &trade,
                             CICTStructureEngine &m15Structure,
                             CICTStructureEngine &m5Structure);
+   // Phase 6
+   void   SetMaxSpreadPips(const double pips)      { m_maxSpreadPips       = pips; }
+   void   SetMaxConsecLosses(const int n)           { m_maxConsecutiveLosses = n;   }
+   bool   IsSpreadAcceptable() const;
+   bool   IsConsecutiveLossBreaker() const;
+   void   OnTradeClosed(const bool isWin);
+   void   LogTradeToCSV(STradeRecord &trade) const;
+   void   ScanAndInvalidatePending(CTrade &trade);
 };
 
 CICTRiskManager::CICTRiskManager()
@@ -132,6 +177,9 @@ CICTRiskManager::CICTRiskManager()
    m_triggerTimeframe    = PERIOD_M5;
    m_pointSize           = _Point;
    m_pipSize             = _Point;
+   m_maxSpreadPips       = 3.0;    ///< Phase 6 default: 3 pips max spread
+   m_maxConsecutiveLosses= 3;      ///< Phase 6 default: 3 consecutive losses
+   m_consecutiveLosses   = 0;
    ZeroMemory(m_snapshot);
    ArrayResize(m_pendingStates, 0);
    ArrayResize(m_positionStates, 0);
@@ -170,11 +218,19 @@ int CICTRiskManager::CurrentDayKey() const
    return (dt.year * 10000) + (dt.mon * 100) + dt.day;
 }
 
+/// @brief Returns an integer key representing the ISO week (year * 100 + week_number).
+/// Uses Monday as the first day of the week per ICT convention.
 int CICTRiskManager::CurrentWeekKey() const
 {
    MqlDateTime dt;
-   TimeToStruct(TimeCurrent(), dt);
-   return (dt.year * 100) + dt.day_of_year / 7;
+   TimeToStruct(TimeGMT(), dt);
+   // Day of week: 0=Sun, 1=Mon, ..., 6=Sat — shift so Monday=0
+   int dow = (dt.day_of_week == 0) ? 6 : dt.day_of_week - 1;
+   // Find Monday of current week
+   datetime monday = TimeGMT() - (datetime)(dow * 86400);
+   MqlDateTime monDt;
+   TimeToStruct(monday, monDt);
+   return monDt.year * 100 + monDt.day_of_year / 7;
 }
 
 void CICTRiskManager::ResetDay()
@@ -528,7 +584,7 @@ void CICTRiskManager::OnTradeTransaction(const MqlTradeTransaction &trans)
    if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
       return;
 
-   HistorySelect(TimeCurrent() - 86400, TimeCurrent() + 60);
+   HistorySelect(TimeCurrent() - 604800, TimeCurrent() + 60);
    if(!HistoryDealSelect(trans.deal))
       return;
 
@@ -536,6 +592,49 @@ void CICTRiskManager::OnTradeTransaction(const MqlTradeTransaction &trans)
       return;
 
    ENUM_DEAL_ENTRY entryType = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+
+   // Handle position close — update loss circuit breaker and write CSV log
+   if(entryType == DEAL_ENTRY_OUT || entryType == DEAL_ENTRY_INOUT)
+   {
+      double closePnL = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+                      + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
+                      + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+      OnTradeClosed(closePnL > 0.0);
+
+      STradeRecord rec;
+      ZeroMemory(rec);
+      rec.id         = (ulong)HistoryDealGetInteger(trans.deal, DEAL_TICKET);
+      rec.closeTime  = (datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME);
+      rec.type       = (ENUM_ORDER_TYPE)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+      rec.closePrice = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
+      rec.lotSize    = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
+      rec.pnlDollars = closePnL;
+      rec.pnlPips    = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+                       / MathMax(rec.lotSize, 0.01) / 10.0;
+      rec.modelName  = HistoryDealGetString(trans.deal, DEAL_COMMENT);
+
+      // Populate entry fields from position history
+      ulong posId = (ulong)HistoryDealGetInteger(trans.deal, DEAL_POSITION_ID);
+      if(HistorySelectByPosition(posId))
+      {
+         for(int d = HistoryDealsTotal() - 1; d >= 0; d--)
+         {
+            ulong dTicket = HistoryDealGetTicket(d);
+            if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(dTicket, DEAL_ENTRY) == DEAL_ENTRY_IN)
+            {
+               rec.openTime   = (datetime)HistoryDealGetInteger(dTicket, DEAL_TIME);
+               rec.entryPrice = HistoryDealGetDouble(dTicket, DEAL_PRICE);
+               rec.slPrice    = HistoryDealGetDouble(dTicket, DEAL_SL);
+               rec.tp1        = HistoryDealGetDouble(dTicket, DEAL_TP);
+               break;
+            }
+         }
+         HistorySelect(TimeCurrent() - 604800, TimeCurrent() + 60);
+      }
+      LogTradeToCSV(rec);
+      return;
+   }
+
    if(entryType != DEAL_ENTRY_IN)
       return;
 
@@ -604,7 +703,8 @@ void CICTRiskManager::ManageOpenPositions(CTrade &trade,
          {
             if(trade.PositionModify(ticket, NormalizeDouble(bePrice, _Digits), takeProfit))
             {
-               double closeVolume = NormalizeVolume(m_positionStates[stateIndex].initialVolume * 0.40);
+               // BUG FIX: was 0.40 (40%), corrected to TP1_RATIO (35%) per ICT split
+               double closeVolume = NormalizeVolume(m_positionStates[stateIndex].initialVolume * TP1_RATIO);
                double minLot      = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
                if(closeVolume < volume && (volume - closeVolume) >= minLot)
                   trade.PositionClosePartial(ticket, closeVolume);
@@ -627,7 +727,8 @@ void CICTRiskManager::ManageOpenPositions(CTrade &trade,
                stopLoss = m15Trail;
             }
 
-            double targetClose = NormalizeVolume(m_positionStates[stateIndex].initialVolume * 0.40);
+            // TP2_RATIO (40%) of initial volume closed at TP2
+            double targetClose = NormalizeVolume(m_positionStates[stateIndex].initialVolume * TP2_RATIO);
             double minLot      = SymbolInfoDouble(m_symbol, SYMBOL_VOLUME_MIN);
             if(targetClose < volume && (volume - targetClose) >= minLot)
                trade.PositionClosePartial(ticket, targetClose);
@@ -645,6 +746,128 @@ void CICTRiskManager::ManageOpenPositions(CTrade &trade,
             trade.PositionModify(ticket, NormalizeDouble(newSL, _Digits), takeProfit);
       }
    }
+}
+
+// ============================================================
+// Phase 6 implementations
+// ============================================================
+
+/// @brief Returns true if current spread is within acceptable limits.
+bool CICTRiskManager::IsSpreadAcceptable() const
+{
+   double spread     = (double)SymbolInfoInteger(m_symbol, SYMBOL_SPREAD) * m_pointSize;
+   double spreadPips = spread / m_pointSize / (double)MARK1_PIP_FACTOR;
+   if(spreadPips > m_maxSpreadPips)
+   {
+      Print("[MARK1][RISK] Spread too high: ", spreadPips, " pips. Max: ", m_maxSpreadPips);
+      return false;
+   }
+   return true;
+}
+
+/// @brief Returns true if the consecutive loss circuit breaker is triggered.
+bool CICTRiskManager::IsConsecutiveLossBreaker() const
+{
+   return (m_consecutiveLosses >= m_maxConsecutiveLosses);
+}
+
+/// @brief Called on trade close. Tracks win/loss streak; resets on new day via Refresh().
+void CICTRiskManager::OnTradeClosed(const bool isWin)
+{
+   if(isWin)
+   {
+      m_consecutiveLosses = 0;
+   }
+   else
+   {
+      m_consecutiveLosses++;
+      if(m_consecutiveLosses >= m_maxConsecutiveLosses)
+         Print("[MARK1][RISK] Consecutive loss breaker triggered (",
+               m_consecutiveLosses, " losses). No new trades today.");
+   }
+}
+
+/// @brief Writes a completed trade record to MQL5/Files/MARK1_Trades.csv.
+void CICTRiskManager::LogTradeToCSV(STradeRecord &rec) const
+{
+   int handle = FileOpen("MARK1_Trades.csv",
+                         FILE_WRITE | FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE)
+   {
+      Print("[MARK1][LOG] Cannot open MARK1_Trades.csv for writing.");
+      return;
+   }
+   // Write header if file is empty
+   if(FileSize(handle) == 0)
+   {
+      FileWrite(handle,
+         "id","openTime","closeTime","type","entry","sl","tp1","tp2","tp3",
+         "closePrice","lots","pnlPips","profit","model","bias",
+         "dowPhase","session","idmSwept","fvgType","obType");
+   }
+   FileSeek(handle, 0, SEEK_END);
+   FileWrite(handle,
+      (long)rec.id,
+      TimeToString(rec.openTime,  TIME_DATE|TIME_SECONDS),
+      TimeToString(rec.closeTime, TIME_DATE|TIME_SECONDS),
+      EnumToString(rec.type),
+      DoubleToString(rec.entryPrice, _Digits),
+      DoubleToString(rec.slPrice,    _Digits),
+      DoubleToString(rec.tp1,        _Digits),
+      DoubleToString(rec.tp2,        _Digits),
+      DoubleToString(rec.tp3,        _Digits),
+      DoubleToString(rec.closePrice, _Digits),
+      DoubleToString(rec.lotSize,    2),
+      DoubleToString(rec.pnlPips,    1),
+      DoubleToString(rec.pnlDollars, 2),
+      rec.modelName,
+      EnumToString(rec.biasAtEntry),
+      rec.dowPhase,
+      rec.session,
+      (int)rec.idmSwept,
+      rec.fvgType,
+      rec.obType
+   );
+   FileClose(handle);
+}
+
+/// @brief Cancels pending orders that have exceeded age or whose session has expired.
+void CICTRiskManager::ScanAndInvalidatePending(CTrade &trade)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetString(ORDER_SYMBOL) != m_symbol) continue;
+      if((long)OrderGetInteger(ORDER_MAGIC) != m_magicNumber) continue;
+
+      datetime orderTime = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
+      string   comment   = OrderGetString(ORDER_COMMENT);
+
+      // Rule 1: Order older than 4 hours — cancel
+      if(TimeGMT() - orderTime > (datetime)(4 * 3600))
+      {
+         if(trade.OrderDelete(ticket))
+            Print("[MARK1][RISK] Pending invalidated (age >4h): #", ticket);
+         continue;
+      }
+      // Rule 2: SilverBullet orders must be cancelled when outside all SB windows
+      if(StringFind(comment, "SilverBullet") >= 0)
+      {
+         MqlDateTime dt;
+         TimeToStruct(TimeGMT(), dt);
+         int mod = dt.hour * 60 + dt.min;
+         bool inAnySB = ((mod >= 480 && mod < 540) ||   // London SB 08:00-09:00
+                         (mod >= 900 && mod < 960) ||   // NY SB AM 15:00-16:00
+                         (mod >= 1140 && mod < 1200));  // NY SB PM 19:00-20:00
+         if(!inAnySB)
+         {
+            if(trade.OrderDelete(ticket))
+               Print("[MARK1][RISK] Pending invalidated (SB session closed): #", ticket);
+         }
+      }
+   }
+   CleanupStates();
 }
 
 #endif // __ICT_RISKMANAGER_MQH__

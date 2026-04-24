@@ -14,7 +14,7 @@ Apply these constraints to every file touched in every phase:
 2. **File header** — every `.mqh` file must begin with:
    ```mql5
    //+------------------------------------------------------------------+
-   //| <Filename>.mqh                                                    |
+   //| <Filename>.mqh                                                   |
    //| MARK1 ICT Expert Advisor — <module description>                  |
    //| Copyright 2024-2025, MARK1 Project                               |
    //+------------------------------------------------------------------+
@@ -170,7 +170,7 @@ After fixing, verify that the weekly drawdown accumulator resets correctly on ea
 **Fix — Step 1:** Create `ICT_Constants.mqh` if it does not exist with:
 ```mql5
 //+------------------------------------------------------------------+
-//| ICT_Constants.mqh                                                 |
+//| ICT_Constants.mqh                                                |
 //| MARK1 — Single source of truth for all compile-time constants    |
 //+------------------------------------------------------------------+
 #pragma once
@@ -1070,7 +1070,7 @@ Add `CIPDAEngine ipdaEngine` to the main EA and call `ipdaEngine.Compute()` on e
 
 ```mql5
 //+------------------------------------------------------------------+
-//| ICT_SMT.mqh                                                       |
+//| ICT_SMT.mqh                                                      |
 //| MARK1 — Smart Money Technique divergence between correlated pairs|
 //+------------------------------------------------------------------+
 #pragma once
@@ -1494,7 +1494,7 @@ Leverage:      1:100
 ```
 
 ### Expected v4.0 Performance Targets (vs v3.2 baseline)
-| Metric           | v3.2 Baseline | v4.0 Target  |
+| Metric          | v3.2 Baseline| v4.0 Target  |
 |-----------------|--------------|--------------|
 | Total Trades    | 132          | 180–250      |
 | Profit Factor   | 1.88         | ≥ 2.10       |

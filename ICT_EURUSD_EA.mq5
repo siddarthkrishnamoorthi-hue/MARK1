@@ -1,12 +1,14 @@
 //+------------------------------------------------------------------+
 //| ICT_EURUSD_EA.mq5                                                |
-//| Modular ICT / SMC EA for EURUSD                                  |
+//| MARK1 ICT Expert Advisor — Modular ICT/SMC EA for EURUSD v4.0   |
+//| Copyright 2024-2025, MARK1 Project                               |
 //+------------------------------------------------------------------+
 #property copyright "MARK1"
-#property version   "4.10"
+#property version   "4.0"
 #property strict
 
 #include <Trade\Trade.mqh>
+#include "ICT_Constants.mqh"
 #include "ICT_Structure.mqh"
 #include "ICT_Session.mqh"
 #include "ICT_Liquidity.mqh"
@@ -15,13 +17,19 @@
 #include "ICT_Bias.mqh"
 #include "ICT_RiskManager.mqh"
 #include "ICT_Visualizer.mqh"
+#include "ICT_EntryModels.mqh"  ///< Phase 5: All 6 ICT entry models
+#include "ICT_IPDA.mqh"         ///< Phase 7: IPDA 20/40/60 bar levels
+#include "ICT_SMT.mqh"          ///< Phase 7: SMT divergence EURUSD/GBPUSD
 
 input group "=== Core Risk ==="
 input double RiskPercent         = 0.50;
 input int    MaxTrades           = 2;
 input double DailyMaxLoss        = 3.0;
 input double WeeklyMaxDD         = 6.0;
-input long   MagicNumber         = 20260419;
+input double MaxSpreadPips       = 3.0;  ///< Phase 6: max spread filter (pips)
+input int    MaxConsecLosses     = 3;    ///< Phase 6: consecutive loss circuit breaker
+// BUG FIX: Magic number is now fixed via MARK1_MAGIC constant in ICT_Constants.mqh
+// The input below is kept for script compatibility but MARK1_MAGIC is used internally.
 
 input group "=== ICT Detection ==="
 input int    OB_Lookback         = 10;
@@ -108,11 +116,25 @@ CICTFVGEngine g_fvgH1;
 CICTFVGEngine g_fvgM15;
 CICTFVGEngine g_fvgM5;
 
+// Phase 2: M1 structure engine for STH/STL hooks
+CICTStructureEngine       g_structureM1;
+// Phase 7: IPDA and SMT engines
+CIPDAEngine               g_ipda;
+CSMTEngine                g_smt;
+// Phase 5: ICT entry models (all 6)
+CSilverBulletModel        g_modelSB;
+CJudasSwingModel          g_modelJS;
+CMarketMakerModel         g_modelMM;
+CTurtleSoupModel          g_modelTS;
+CLondonCloseReversalModel g_modelLC;
+CTGIFModel                g_modelTGIF;
+
 datetime               g_lastBarTime      = 0;
 ICTLiquiditySweepSignal g_activeSweep;
 bool                   g_hasActiveSweep   = false;
 datetime               g_lastSetupSweep   = 0;
 bool                   g_lastSetupBullish = false;
+datetime               g_lastD1BarTime    = 0;    ///< Phase 7: tracks D1 bar for IPDA/SMT updates
 
 void Log(const string message)
 {
@@ -167,6 +189,7 @@ void RefreshAnalysisEngines()
    g_structureH1.Refresh(300);
    g_structureM15.Refresh(400);
    g_structureM5.Refresh(500);
+   g_structureM1.Refresh(1000);  ///< Phase 2: M1 STH/STL
 }
 
 double PipSize()
@@ -281,7 +304,7 @@ bool HasManagedPendingAtPrice(const bool bullish, const double entryPrice, const
          continue;
       if(OrderGetString(ORDER_SYMBOL) != _Symbol)
          continue;
-      if((long)OrderGetInteger(ORDER_MAGIC) != MagicNumber)
+      if((long)OrderGetInteger(ORDER_MAGIC) != MARK1_MAGIC)
          continue;
       if((ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE) != wantedType)
          continue;
@@ -851,15 +874,22 @@ int OnInit()
    if(StringFind(_Symbol, "EURUSD") < 0)
       Print("[ICT_EURUSD_EA] WARNING: tuned for EURUSD. Current symbol=", _Symbol);
 
-   g_trade.SetExpertMagicNumber(MagicNumber);
+   g_trade.SetExpertMagicNumber(MARK1_MAGIC);   // BUG FIX: use fixed constant, never changes
    g_trade.SetDeviationInPoints(20);
    g_trade.SetTypeFilling(ORDER_FILLING_RETURN);
+
+   // Validate TP ratios sum to 1.0
+   if(MathAbs(TP1_RATIO + TP2_RATIO + TP3_RATIO - 1.0) > 0.0001)
+      Print("[MARK1][WARN] TP ratios do not sum to 1.0: ",
+            TP1_RATIO, " + ", TP2_RATIO, " + ", TP3_RATIO);
 
    g_session.Configure(_Symbol, Timeframe_Trigger, EnableNewsFilter, NewsHaltBeforeMin, NewsResumeAfterMin);
    g_liquidity.Configure(_Symbol, Timeframe_Trigger, EqualTolerancePips, MinSweepPips);
    g_bias.Configure(_Symbol, SwingStrength, 80, Timeframe_Bias, Timeframe_Swing, Timeframe_Entry);
-   g_risk.Configure(_Symbol, MagicNumber, RiskPercent, MaxTrades, DailyMaxLoss, WeeklyMaxDD,
+   g_risk.Configure(_Symbol, MARK1_MAGIC, RiskPercent, MaxTrades, DailyMaxLoss, WeeklyMaxDD,
                     PendingExpiryBars, BreakEvenBufferPips, EnableTrailingStop, Timeframe_Trigger);
+   g_risk.SetMaxSpreadPips(MaxSpreadPips);
+   g_risk.SetMaxConsecLosses(MaxConsecLosses);
    g_visualizer.Configure("ICT", DrawZones);
 
    g_structureH4.Configure(_Symbol, PERIOD_H4, SwingStrength);
@@ -878,6 +908,24 @@ int OnInit()
 
    g_lastBarTime = iTime(_Symbol, Timeframe_Trigger, 0);
    ZeroMemory(g_activeSweep);
+
+   // Phase 2: M1 structure engine for STH/STL hooks
+   g_structureM1.Configure(_Symbol, PERIOD_M1, 3);
+
+   // Phase 7: IPDA and SMT initial computation
+   g_ipda.SetSymbol(_Symbol);
+   g_ipda.Compute();
+   g_smt.Scan(PERIOD_H1, 100);
+   g_lastD1BarTime = iTime(_Symbol, PERIOD_D1, 0);
+
+   // Phase 5: Bind all entry models to the active symbol
+   g_modelSB.SetSymbol(_Symbol);
+   g_modelJS.SetSymbol(_Symbol);
+   g_modelMM.SetSymbol(_Symbol);
+   g_modelTS.SetSymbol(_Symbol);
+   g_modelLC.SetSymbol(_Symbol);
+   g_modelTGIF.SetSymbol(_Symbol);
+
    return INIT_SUCCEEDED;
 }
 
@@ -903,8 +951,58 @@ void OnTick()
    if(risk.dailyBlocked || risk.weeklyBlocked || session.newsBlocked)
       g_risk.CancelAllPending(g_trade, "blocked");
 
+   // Phase 6: Spread filter — reject new signals but allow management to continue
+   if(!g_risk.IsSpreadAcceptable())
+      return;
+
+   // Phase 6: Consecutive loss circuit breaker
+   if(g_risk.IsConsecutiveLossBreaker())
+   {
+      Print("[MARK1][RISK] Consecutive loss circuit breaker active — halting entries");
+      return;
+   }
+
    if(!IsNewBar())
       return;
+
+   // Phase 6: Sweep-age / session invalidation of stale pending orders
+   g_risk.ScanAndInvalidatePending(g_trade);
+
+   // Phase 7: Update IPDA and SMT on each new D1 bar
+   {
+      datetime d1Bar = iTime(_Symbol, PERIOD_D1, 0);
+      if(d1Bar > 0 && d1Bar > g_lastD1BarTime)
+      {
+         g_lastD1BarTime = d1Bar;
+         g_ipda.Compute();
+         g_smt.Scan(PERIOD_H1, 100);
+         if(DrawZones)
+         {
+            SIPDARange     ipdaSnap = g_ipda.GetRange();
+            SSMTDivergence smtSnap  = g_smt.GetDivergence();
+            g_visualizer.DrawIPDALevels(ipdaSnap);
+            g_visualizer.DrawSMTMarker(smtSnap);
+            g_visualizer.DrawDOWPhaseLabel(bias.currentDOWPhase);
+            // Judas Swing PO3 box (Phase 8)
+            if(session.judasSM.detected)
+            {
+               datetime t2 = (session.judasSM.confirmationTime > 0)
+                             ? session.judasSM.confirmationTime
+                             : TimeCurrent();
+               g_visualizer.DrawPO3Box(session.judasSM.currentPhase,
+                                       session.judasSM.manipulationTime, t2,
+                                       session.judasSM.manipulationHigh,
+                                       session.judasSM.manipulationLow);
+               g_visualizer.DrawJudasMarker(session.judasSM);
+            }
+            // NDOG / NWOG lines (Phase 8)
+            SOpeningGap ndog = ComputeNDOG(_Symbol);
+            SOpeningGap nwog = ComputeNWOG(_Symbol);
+            g_visualizer.DrawNDOGLines(ndog);
+            g_visualizer.DrawNWOGLines(nwog);
+         }
+      }
+   }
 
    if(!session.asianRangeReady)
       return;
@@ -981,7 +1079,65 @@ void OnTick()
                                        continuationSetup.tp1,
                                        continuationSetup.tp2,
                                        continuationSetup.tp3);
-            PlaceSetup(continuationSetup);
+            placed = PlaceSetup(continuationSetup);
+         }
+      }
+   }
+
+   // Phase 5: ICT Entry Models — scan all 6 models if no canonical setup matched
+   if(!placed)
+   {
+      SMarketContext ctx;
+      ctx.session    = session;
+      ctx.bias       = bias;
+      double pdh = 0.0, pdl = 0.0;
+      g_liquidity.GetPreviousDayHighLow(pdh, pdl);
+      ctx.h4RangeHigh = (pdh > 0.0) ? pdh : iHigh(_Symbol, PERIOD_H4, 1);
+      ctx.h4RangeLow  = (pdl > 0.0) ? pdl : iLow (_Symbol, PERIOD_H4, 1);
+      ctx.entryPrice  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+      CEntryModel *models[6];
+      models[0] = GetPointer(g_modelSB);
+      models[1] = GetPointer(g_modelJS);
+      models[2] = GetPointer(g_modelMM);
+      models[3] = GetPointer(g_modelTS);
+      models[4] = GetPointer(g_modelLC);
+      models[5] = GetPointer(g_modelTGIF);
+
+      for(int m = 0; m < 6 && !placed; m++)
+      {
+         if(models[m].Scan(ctx))
+         {
+            STradeSetup ts = models[m].GetSetup();
+            if(!ts.valid) continue;
+            if(!IsValidLimitOrderPlan(ts.bullish, ts.entry, ts.stopLoss, ts.tp3))
+               continue;
+            if(HasManagedPendingAtPrice(ts.bullish, ts.entry, ts.stopLoss))
+               continue;
+
+            ulong ticket = 0;
+            if(g_risk.PlaceLimitOrder(g_trade,
+                                      ts.bullish,
+                                      ts.entry,
+                                      ts.stopLoss,
+                                      ts.tp3,
+                                      ts.tp1,
+                                      ts.tp2,
+                                      100.0,
+                                      ts.modelName,
+                                      ticket))
+            {
+               g_lastSetupSweep   = TimeCurrent();
+               g_lastSetupBullish = ts.bullish;
+               placed = true;
+               if(DrawZones)
+               {
+                  g_visualizer.DrawTradePlan(ts.bullish, ts.entry,
+                                             ts.stopLoss, ts.tp1, ts.tp2, ts.tp3);
+               }
+               Print("[MARK1][EA][", ts.modelName, "] ticket=", ticket,
+                     " entry=", ts.entry, " SL=", ts.stopLoss);
+            }
          }
       }
    }

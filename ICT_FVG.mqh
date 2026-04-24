@@ -1,9 +1,13 @@
 //+------------------------------------------------------------------+
-//| ICT_FVG.mqh                                                      |
-//| Fair Value Gap, inverse gap, and BPR engine                      |
+//| ICT_FVG.mqh                                                       |
+//| MARK1 ICT Expert Advisor — Fair Value Gap, IFVG, and BPR engine  |
+//| Copyright 2024-2025, MARK1 Project                               |
 //+------------------------------------------------------------------+
+#pragma once
 #ifndef __ICT_FVG_MQH__
 #define __ICT_FVG_MQH__
+
+#include "ICT_Constants.mqh"
 
 enum ENUM_ICT_FVG_STATE
 {
@@ -25,6 +29,8 @@ struct ICTFVGZone
    double             high;
    double             midpoint;
    double             consequentEncroachment;
+   double             centerCandleOpen;   ///< Open of center candle (candle[1] in FVG detection)
+   double             centerCandleClose;  ///< Close of center candle
    double             sizePoints;
    ENUM_ICT_FVG_STATE state;
 };
@@ -98,9 +104,13 @@ bool CICTFVGEngine::LoadRates(const int count, MqlRates &rates[]) const
 
 void CICTFVGEngine::FinalizeZone(ICTFVGZone &zone) const
 {
-   zone.midpoint                = (zone.low + zone.high) * 0.5;
-   zone.consequentEncroachment  = zone.midpoint;
-   zone.sizePoints              = (zone.high - zone.low) / m_pointSize;
+   zone.midpoint   = (zone.low + zone.high) * 0.5;
+   // CE = 50% of center candle body per ICT definition (BUG FIX: was gap midpoint)
+   if(zone.centerCandleOpen > 0.0 && zone.centerCandleClose > 0.0)
+      zone.consequentEncroachment = (zone.centerCandleOpen + zone.centerCandleClose) / 2.0;
+   else
+      zone.consequentEncroachment = zone.midpoint;
+   zone.sizePoints = (zone.high - zone.low) / m_pointSize;
 }
 
 bool CICTFVGEngine::FindLatestFVG(const bool bullish,
@@ -127,14 +137,16 @@ bool CICTFVGEngine::FindLatestFVG(const bool bullish,
          double newLow  = rates[center - 1].low;
          if(oldHigh < newLow && (newLow - oldHigh) >= (m_minGapPoints * m_pointSize))
          {
-            zone.valid      = true;
-            zone.bullish    = true;
-            zone.timeframe  = m_timeframe;
-            zone.sourceShift= center;
-            zone.formedTime = formedTime;
-            zone.low        = oldHigh;
-            zone.high       = newLow;
-            zone.state      = ICT_FVG_ACTIVE;
+            zone.valid             = true;
+            zone.bullish           = true;
+            zone.timeframe         = m_timeframe;
+            zone.sourceShift       = center;
+            zone.formedTime        = formedTime;
+            zone.low               = oldHigh;
+            zone.high              = newLow;
+            zone.centerCandleOpen  = rates[center].open;
+            zone.centerCandleClose = rates[center].close;
+            zone.state             = ICT_FVG_ACTIVE;
             FinalizeZone(zone);
             return true;
          }
@@ -145,14 +157,16 @@ bool CICTFVGEngine::FindLatestFVG(const bool bullish,
          double newHigh = rates[center - 1].high;
          if(oldLow > newHigh && (oldLow - newHigh) >= (m_minGapPoints * m_pointSize))
          {
-            zone.valid      = true;
-            zone.bullish    = false;
-            zone.timeframe  = m_timeframe;
-            zone.sourceShift= center;
-            zone.formedTime = formedTime;
-            zone.low        = newHigh;
-            zone.high       = oldLow;
-            zone.state      = ICT_FVG_ACTIVE;
+            zone.valid             = true;
+            zone.bullish           = false;
+            zone.timeframe         = m_timeframe;
+            zone.sourceShift       = center;
+            zone.formedTime        = formedTime;
+            zone.low               = newHigh;
+            zone.high              = oldLow;
+            zone.centerCandleOpen  = rates[center].open;
+            zone.centerCandleClose = rates[center].close;
+            zone.state             = ICT_FVG_ACTIVE;
             FinalizeZone(zone);
             return true;
          }
@@ -252,6 +266,81 @@ bool CICTFVGEngine::FindLatestBPR(const int lookbackBars, ICTBPRZone &bpr) const
    bpr.bullishFVGTime = bullishZone.formedTime;
    bpr.bearishFVGTime = bearishZone.formedTime;
    return true;
+}
+
+// ============================================================
+// Phase 3 — Implied Fair Value Gap (IFVG)
+// ============================================================
+
+/// @brief Implied Fair Value Gap (wick-to-open gap, weaker than full body FVG).
+struct SImpliedFVG
+{
+   double   gapHigh;
+   double   gapLow;
+   double   consequentEncroachment;  ///< 50% of center candle body
+   datetime time;
+   bool     isBullish;
+   bool     isFilled;
+};
+
+/// @brief Detects the most recent unfilled Implied FVG on the given timeframe.
+/// Bullish IFVG: candle[A].high < candle[C].open (wick-to-open gap)
+/// Bearish IFVG: candle[A].low  > candle[C].open
+/// @param symbol    Instrument
+/// @param tf        Timeframe
+/// @param lookback  Bars to scan
+/// @param result    Output struct
+/// @return True if IFVG found
+bool DetectImpliedFVG(const string symbol,
+                      const ENUM_TIMEFRAMES tf,
+                      const int lookback,
+                      SImpliedFVG &result)
+{
+   ZeroMemory(result);
+   MqlRates rates[];
+   ArraySetAsSeries(rates, true);
+   int copied = CopyRates(symbol, tf, 0, lookback + 5, rates);
+   if(copied < 4) return false;
+
+   double pointSize = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double digits    = (double)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   double minGap    = pointSize * 10.0;  // minimum 1 pip gap
+
+   for(int c = lookback; c >= 2; c--)
+   {
+      // Bullish IFVG: A.high < C.open  (wick-to-open gap)
+      if(rates[c + 1].high < rates[c - 1].open - minGap)
+      {
+         result.gapLow  = rates[c + 1].high;
+         result.gapHigh = rates[c - 1].open;
+         result.consequentEncroachment = (rates[c].open + rates[c].close) / 2.0;
+         result.time      = rates[c].time;
+         result.isBullish = true;
+         // Check if filled (price traded below gapLow since formation)
+         result.isFilled = false;
+         for(int k = c - 1; k >= 1; k--)
+         {
+            if(rates[k].low <= result.gapLow) { result.isFilled = true; break; }
+         }
+         if(!result.isFilled) return true;
+      }
+      // Bearish IFVG: A.low > C.open
+      if(rates[c + 1].low > rates[c - 1].open + minGap)
+      {
+         result.gapHigh = rates[c + 1].low;
+         result.gapLow  = rates[c - 1].open;
+         result.consequentEncroachment = (rates[c].open + rates[c].close) / 2.0;
+         result.time      = rates[c].time;
+         result.isBullish = false;
+         result.isFilled  = false;
+         for(int k = c - 1; k >= 1; k--)
+         {
+            if(rates[k].high >= result.gapHigh) { result.isFilled = true; break; }
+         }
+         if(!result.isFilled) return true;
+      }
+   }
+   return false;
 }
 
 #endif // __ICT_FVG_MQH__
