@@ -99,18 +99,14 @@ bool CICTFVGEngine::LoadRates(const int count, MqlRates &rates[]) const
 {
    ArraySetAsSeries(rates, true);
    int copied = CopyRates(m_symbol, m_timeframe, 0, count, rates);
-   return (copied > 10);
+   return (copied >= count);
 }
 
 void CICTFVGEngine::FinalizeZone(ICTFVGZone &zone) const
 {
-   zone.midpoint   = (zone.low + zone.high) * 0.5;
-   // CE = 50% of center candle body per ICT definition (BUG FIX: was gap midpoint)
-   if(zone.centerCandleOpen > 0.0 && zone.centerCandleClose > 0.0)
-      zone.consequentEncroachment = (zone.centerCandleOpen + zone.centerCandleClose) / 2.0;
-   else
-      zone.consequentEncroachment = zone.midpoint;
-   zone.sizePoints = (zone.high - zone.low) / m_pointSize;
+   zone.midpoint                = (zone.low + zone.high) * 0.5;
+   zone.consequentEncroachment  = zone.midpoint;   ///< CE = 50% of FVG gap per ICT definition
+   zone.sizePoints              = (zone.high - zone.low) / m_pointSize;
 }
 
 bool CICTFVGEngine::FindLatestFVG(const bool bullish,
@@ -125,7 +121,7 @@ bool CICTFVGEngine::FindLatestFVG(const bool bullish,
    if(!LoadRates(lookbackBars + 10, rates))
       return false;
 
-   for(int center = lookbackBars; center >= 2; center--)
+   for(int center = 2; center <= lookbackBars; center++)
    {
       datetime formedTime = rates[center].time;
       if(formedAfter > 0 && formedTime <= formedAfter)
@@ -277,7 +273,7 @@ struct SImpliedFVG
 {
    double   gapHigh;
    double   gapLow;
-   double   consequentEncroachment;  ///< 50% of center candle body
+   double   consequentEncroachment;  ///< 50% of implied gap (CE)
    datetime time;
    bool     isBullish;
    bool     isFilled;
@@ -300,20 +296,20 @@ bool DetectImpliedFVG(const string symbol,
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
    int copied = CopyRates(symbol, tf, 0, lookback + 5, rates);
-   if(copied < 4) return false;
+   if(copied < lookback + 5) return false;
 
    double pointSize = SymbolInfoDouble(symbol, SYMBOL_POINT);
    double digits    = (double)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    double minGap    = pointSize * 10.0;  // minimum 1 pip gap
 
-   for(int c = lookback; c >= 2; c--)
+   for(int c = 2; c <= lookback; c++)
    {
       // Bullish IFVG: A.high < C.open  (wick-to-open gap)
       if(rates[c + 1].high < rates[c - 1].open - minGap)
       {
          result.gapLow  = rates[c + 1].high;
          result.gapHigh = rates[c - 1].open;
-         result.consequentEncroachment = (rates[c].open + rates[c].close) / 2.0;
+         result.consequentEncroachment = (result.gapLow + result.gapHigh) / 2.0;
          result.time      = rates[c].time;
          result.isBullish = true;
          // Check if filled (price traded below gapLow since formation)
@@ -329,7 +325,7 @@ bool DetectImpliedFVG(const string symbol,
       {
          result.gapHigh = rates[c + 1].low;
          result.gapLow  = rates[c - 1].open;
-         result.consequentEncroachment = (rates[c].open + rates[c].close) / 2.0;
+         result.consequentEncroachment = (result.gapLow + result.gapHigh) / 2.0;
          result.time      = rates[c].time;
          result.isBullish = false;
          result.isFilled  = false;
