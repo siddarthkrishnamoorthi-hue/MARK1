@@ -279,9 +279,9 @@ bool CICTBiasEngine::Refresh(const ICTSessionSnapshot &session)
    m_snapshot.po3Distribution = (session.inNYAMKillzone || session.inNYSilverBulletAM || session.inNYSilverBulletPM);
 
    m_snapshot.longAllowed  = (m_snapshot.consensusBias == ICT_SESSION_BIAS_LONG_ONLY &&
-                              (m_snapshot.pdaZone == ICT_PDA_DISCOUNT || m_snapshot.pdaZone == ICT_PDA_EQUILIBRIUM));
+                              m_snapshot.pdaZone == ICT_PDA_DISCOUNT);
    m_snapshot.shortAllowed = (m_snapshot.consensusBias == ICT_SESSION_BIAS_SHORT_ONLY &&
-                              (m_snapshot.pdaZone == ICT_PDA_PREMIUM || m_snapshot.pdaZone == ICT_PDA_EQUILIBRIUM));
+                              m_snapshot.pdaZone == ICT_PDA_PREMIUM);
 
    return true;
 }
