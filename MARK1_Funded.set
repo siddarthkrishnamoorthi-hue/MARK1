@@ -5,7 +5,6 @@ DailyMaxLoss=3.0||3.0||0.250000||5.000000||N
 WeeklyMaxDD=6.0||6.0||0.250000||8.000000||N
 MaxSpreadPips=3.0||3.0||1.000000||5.000000||N
 MaxConsecLosses=3||3||1||5||N
-MagicNumber=600001||600001||1||20269999||N
 OB_Lookback=10||10||1||20||N
 FVG_MinGap=10||10||1||20||N
 SwingStrength=3||3||1||5||N
