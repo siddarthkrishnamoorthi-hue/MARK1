@@ -38,16 +38,16 @@ The codebase is split into a thin EA driver and nine single-responsibility heade
 |------|------|
 | `ICT_EURUSD_EA.mq5` | EA entry point — `OnInit`, `OnTick`, `OnTradeTransaction`; wires all engines together |
 | `ICT_Constants.mqh` | Global constants: `MARK1_MAGIC`, `MARK1_VERSION`, pip factor, TP ratios |
-| `ICT_Structure.mqh` | Swing-high/low detection, BOS/CHoCH/MSS classification, structure snapshots |
+| `ICT_Structure.mqh` | Swing-high/low detection with H→L→H→L alternation enforcement, BOS/CHoCH/MSS classification, structure snapshots |
 | `ICT_FVG.mqh` | Fair Value Gap detection, Consequent Encroachment, Implied FVG, Balanced Price Range |
 | `ICT_Session.mqh` | Kill-zone windows, Silver Bullet windows, Asian range, Judas Swing / PO3, London Close, Midnight Open |
-| `ICT_Bias.mqh` | 3-TF consensus bias (D1 + H4 + H1), DOW phase filter, PDA zone (premium / discount / equilibrium) |
+| `ICT_Bias.mqh` | 3-TF consensus bias (D1 + H4 + H1), W1/MN1 structure-based weekly/monthly bias, DOW phase filter, PDA zone (premium / discount / equilibrium) |
 | `ICT_Liquidity.mqh` | Liquidity sweep detection, BSL/SSL classification, PDH/PDL/PWH/PWL, NDOG/NWOG, DOL target selection, Run-on-Stops |
 | `ICT_OrderBlock.mqh` | Order Block detection, Breaker Block, Mitigation Block, Rejection Block, Propulsion Block, Vacuum Block |
 | `ICT_RiskManager.mqh` | Position sizing, TP-split execution, break-even, trailing stop, drawdown guards, spread filter, loss circuit breaker, CSV trade log |
 | `ICT_EntryModels.mqh` | Six ICT entry model classes — Silver Bullet, Judas Swing, Market Maker, Turtle Soup, London Close Reversal, TGIF |
-| `ICT_IPDA.mqh` | IPDA draw-on-liquidity 20/40/60-bar range engine, equilibrium detection |
-| `ICT_SMT.mqh` | Smart Money Technique divergence scanner (EUR/USD vs GBP/USD) |
+| `ICT_IPDA.mqh` | IPDA draw-on-liquidity 20/40/60-bar range engine, equilibrium gate for trade decisions |
+| `ICT_SMT.mqh` | Smart Money Technique divergence scanner (EUR/USD vs GBP/USD), confluence scoring integration |
 | `ICT_Visualizer.mqh` | Chart-object drawing layer — zones, sweeps, IPDA levels, SMT markers, PO3 boxes, DOW labels, NDOG/NWOG lines |
 
 ---
@@ -100,11 +100,17 @@ Multiple overlapping zones are intersected into a single high-probability entry 
 
 ### IPDA Levels
 
-The **IPDA engine** computes 20-, 40-, and 60-bar draw-on-liquidity levels on D1. These define the macro premium/discount array and the expected price delivery range for the current quarter or month. Entry bias aligns with price being at or near the equilibrium midpoint of the active IPDA range.
+The **IPDA engine** computes 20-, 40-, and 60-bar draw-on-liquidity levels on D1. These define the macro premium/discount array and the expected price delivery range for the current quarter or month. IPDA levels are integrated directly into trade decisions:
+
+- **Equilibrium gate**: If the entry zone midpoint is within 5 pips of the 20-bar IPDA equilibrium, the setup is rejected (price is seeking direction — no directional edge).
+- **Discount/premium confluence**: If a bullish entry is within 10 pips of the 20-bar IPDA low (institutional accumulation zone), `+1` confluence is added. Mirror logic for bearish setups at the IPDA high.
 
 ### SMT Divergence
 
-When EUR/USD makes a new swing low (bullish setup) but GBP/USD does **not** confirm that low, an **SMT bullish divergence** is flagged — indicating institutional accumulation on EUR/USD. The mirror applies for bearish setups. SMT signals add a confluence point and are visualized on the chart.
+When EUR/USD makes a new swing low (bullish setup) but GBP/USD does **not** confirm that low, an **SMT bullish divergence** is flagged — indicating institutional accumulation on EUR/USD. The mirror applies for bearish setups. SMT divergence is updated on each new H1 bar and integrated into the confluence scoring:
+
+- **Aligned SMT**: If the divergence direction matches the trade direction, `+1` confluence.
+- **Opposing SMT**: If the divergence direction opposes the trade direction, `−1` confluence (reduces edge).
 
 ### OTE (Optimal Trade Entry)
 
@@ -358,3 +364,4 @@ See [instructions.md](instructions.md) §11 for detailed usage of each script.
 | v2.0 | Modular split into headers; dynamic lot sizing; kill-zone filter |
 | v3.0 | Phase 1–6 — full ICT concept suite, entry models, risk hardening |
 | **v4.0** | Phase 7–9 — IPDA engine, SMT divergence, visualizer layer, Python suite; all compile errors resolved |
+| **v4.1** | Enhancement session — swing alternation enforcement (H→L→H→L), W1/MN1 structure-based bias, IPDA equilibrium gate + discount/premium confluence, SMT confluence scoring, TurtleSoup IDM direction fix, RiskManager CSV pnlPips/tp2/tp3 fix, Visualizer TimeGMT consistency, W1/MN1 bar-change performance gate |
