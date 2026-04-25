@@ -56,10 +56,10 @@ ACTIVE_PARAMS = ["RiskPercent", "MaxSpreadPips", "MinRR"]
 # ------------------------------------------------------------------------------
 
 def _detect_set_encoding(path: Path) -> str:
-    """Detect whether .set file is UTF-16-LE (BOM) or ANSI."""
+    """Detect whether .set file is UTF-16 (BOM) or UTF-8."""
     with open(path, "rb") as f:
         bom = f.read(2)
-    return "utf-16-le" if bom == b"\xff\xfe" else "utf-8"
+    return "utf-16" if bom == b"\xff\xfe" else "utf-8"
 
 
 def read_set_file(path: Path) -> dict[str, str]:
@@ -144,23 +144,24 @@ def optimize(set_path: Path,
     print(f"[Optimizer] {total} combinations over {active_params}")
 
     results = []
-    for idx, combo in enumerate(combinations, start=1):
-        param_dict = dict(zip(active_params, combo))
-        print(f"  [{idx}/{total}] {param_dict}")
+    try:
+        for idx, combo in enumerate(combinations, start=1):
+            param_dict = dict(zip(active_params, combo))
+            print(f"  [{idx}/{total}] {param_dict}")
 
-        # Apply combo to .set file
-        test_params = base_params.copy()
-        for k, v in param_dict.items():
-            test_params[k] = str(v)
-        write_set_file(set_path, test_params)
+            # Apply combo to .set file
+            test_params = base_params.copy()
+            for k, v in param_dict.items():
+                test_params[k] = str(v)
+            write_set_file(set_path, test_params)
 
-        # Run tester
-        result = run_backtest_and_read_result(symbol, set_path)
-        row = {**param_dict, **result}
-        results.append(row)
-
-    # Restore original params
-    write_set_file(set_path, base_params)
+            # Run tester
+            result = run_backtest_and_read_result(symbol, set_path)
+            row = {**param_dict, **result}
+            results.append(row)
+    finally:
+        # Always restore original params even if an exception occurs
+        write_set_file(set_path, base_params)
 
     # Write report
     if results:
