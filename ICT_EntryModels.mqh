@@ -221,6 +221,11 @@ public:
       double rr1       = MathAbs(m_setup.entry - m_setup.stopLoss);
       m_setup.tp1      = bullish ? m_setup.entry + rr1    : m_setup.entry - rr1;
       m_setup.tp2      = bullish ? js.asianRangeHigh      : js.asianRangeLow;
+      // Validate TP2 is on correct side of entry; fallback to 2R
+      if(bullish && m_setup.tp2 <= m_setup.tp1)
+         m_setup.tp2 = m_setup.entry + rr1 * 2.0;
+      if(!bullish && m_setup.tp2 >= m_setup.tp1)
+         m_setup.tp2 = m_setup.entry - rr1 * 2.0;
       m_setup.tp3      = SelectDOLTarget(m_symbol, bullish, m_setup.entry).price;
       if(m_setup.tp3 == 0.0) m_setup.tp3 = m_setup.tp2;
 
@@ -524,6 +529,11 @@ public:
       m_setup.tp2   = ctx.session.midnightOpenPrice > 0.0
                       ? ctx.session.midnightOpenPrice
                       : (bullish ? m_setup.entry + rr*2 : m_setup.entry - rr*2);
+      // Validate TP2 is on correct side; fallback to 2R
+      if(bullish && m_setup.tp2 <= m_setup.tp1)
+         m_setup.tp2 = m_setup.entry + rr * 2.0;
+      if(!bullish && m_setup.tp2 >= m_setup.tp1)
+         m_setup.tp2 = m_setup.entry - rr * 2.0;
       {
          SDOLTarget dol = SelectDOLTarget(m_symbol, bullish, m_setup.entry);
          m_setup.tp3   = (dol.type != DOL_NONE) ? dol.price : m_setup.tp2;
@@ -632,6 +642,11 @@ public:
                          ? ctx.session.midnightOpenPrice
                          : (m_setup.bullish ? m_setup.entry + riskDist * 2.0
                                             : m_setup.entry - riskDist * 2.0);
+      // Validate TP2 is on correct side; fallback to 2R
+      if(m_setup.bullish && m_setup.tp2 <= m_setup.tp1)
+         m_setup.tp2 = m_setup.entry + riskDist * 2.0;
+      if(!m_setup.bullish && m_setup.tp2 >= m_setup.tp1)
+         m_setup.tp2 = m_setup.entry - riskDist * 2.0;
       {
          bool fadeDir   = !weeklyBullish;
          SDOLTarget dol = SelectDOLTarget(m_symbol, fadeDir, m_setup.entry);
