@@ -354,7 +354,9 @@ Click the **Journal** tab in the Terminal panel. Any MT5 system-level errors (e.
 
 ### What to expect during live trading
 - The EA scans for setups on every **new M5 bar** (not every tick).
-- IPDA and SMT data update once per **new D1 bar**.
+- IPDA levels update once per **new D1 bar** and are used as a trade gate (equilibrium rejection) and confluence factor.
+- SMT divergence updates once per **new H1 bar** and is scored as a confluence factor (aligned +1, opposing −1).
+- Weekly/monthly bias updates once per **new W1/MN1 bar** using structure-based analysis (HH+HL / LH+LL), not single-candle direction.
 - Trades are placed as **limit orders** at FVG / OB levels. You will see them in the **Trade** tab of the Terminal as pending orders.
 - When a limit order fills, it becomes an open position. Break-even and partial TP management happen automatically.
 - All closed trades are logged to `MQL5\Files\MARK1_Trades.csv`.
