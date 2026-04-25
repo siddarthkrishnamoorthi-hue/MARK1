@@ -200,6 +200,7 @@ void CICTSessionEngine::ResetForDay(const MqlDateTime &dt)
    m_snapshot.nyAMRangeReady  = false;
    m_snapshot.activeWindow    = ICT_SESSION_NONE;
    m_snapshot.newsBlocked     = false;
+   ZeroMemory(m_snapshot.judasSM);
    m_lastDayKey               = m_snapshot.dayKey;
    m_lastRangeBarTime         = 0;
 }
@@ -254,9 +255,6 @@ bool CICTSessionEngine::IsHardcodedNewsTime(const datetime gmtTime) const
             return true;
       }
    }
-
-   if((dt.hour == 13 || dt.hour == 14) && (dt.day_of_week == 2 || dt.day_of_week == 4))
-      return true;
 
    return false;
 }
@@ -337,7 +335,7 @@ bool CICTSessionEngine::Refresh()
    int minuteOfDay = MinuteOfDay(gmtDt);
    m_snapshot.gmtTime               = gmtTime;
    m_snapshot.inAsian               = IsWindow(minuteOfDay, 60, 300);
-   m_snapshot.inLondonKillzone      = IsWindow(minuteOfDay, 420, 600);
+   m_snapshot.inLondonKillzone      = IsWindow(minuteOfDay, 420, 720);
    m_snapshot.inLondonSilverBullet  = IsWindow(minuteOfDay, 480, 540);
    m_snapshot.inLondonCloseWindow   = IsWindow(minuteOfDay,
                                                LONDON_CLOSE_START_GMT * 60,
