@@ -104,7 +104,7 @@ def scan_smt_divergences(
         gbp_phigh = gbp_prev["high"].max()
 
         # Bullish SMT: EUR makes lower low, GBP does NOT
-        if eur_low < eur_plw and gbp_low > gbp_plw:
+        if eur_low < eur_plw and gbp_low >= gbp_plw:
             dv = SMTDivergence(
                 is_bullish=True,
                 eur_level=eur_low,
@@ -118,7 +118,7 @@ def scan_smt_divergences(
                       f"EUR low={dv.eur_level:.5f}  GBP low={dv.gbp_level:.5f}")
 
         # Bearish SMT: EUR makes higher high, GBP does NOT
-        elif eur_high > eur_phigh and gbp_high < gbp_phigh:
+        elif eur_high > eur_phigh and gbp_high <= gbp_phigh:
             dv = SMTDivergence(
                 is_bullish=False,
                 eur_level=eur_high,
