@@ -134,7 +134,8 @@ ICTLiquiditySweepSignal g_activeSweep;
 bool                   g_hasActiveSweep   = false;
 datetime               g_lastSetupSweep   = 0;
 bool                   g_lastSetupBullish = false;
-datetime               g_lastD1BarTime    = 0;    ///< Phase 7: tracks D1 bar for IPDA/SMT updates
+datetime               g_lastD1BarTime    = 0;    ///< Phase 7: tracks D1 bar for IPDA updates
+datetime               g_lastH1BarTime    = 0;    ///< Phase 7: tracks H1 bar for SMT updates
 
 void Log(const string message)
 {
@@ -601,8 +602,8 @@ bool BuildSetupCandidate(const bool bullish,
    if(setup.bpr.valid && ZonesOverlap(setup.zoneLow, setup.zoneHigh, setup.bpr.low, setup.bpr.high)) setup.confluenceScore++;
    if(session.inMacroWindow || session.inLondonSilverBullet || session.inNYSilverBulletAM || session.inNYSilverBulletPM)
       setup.confluenceScore++;
-   if((bullish && (bias.pdaZone == ICT_PDA_DISCOUNT || bias.pdaZone == ICT_PDA_EQUILIBRIUM)) ||
-      (!bullish && (bias.pdaZone == ICT_PDA_PREMIUM || bias.pdaZone == ICT_PDA_EQUILIBRIUM)))
+   if((bullish && bias.pdaZone == ICT_PDA_DISCOUNT) ||
+      (!bullish && bias.pdaZone == ICT_PDA_PREMIUM))
       setup.confluenceScore++;
    if(requirePostSweep && contextTime > 0)
       setup.confluenceScore++;
@@ -908,6 +909,9 @@ int OnInit()
 
    g_lastBarTime = iTime(_Symbol, Timeframe_Trigger, 0);
    ZeroMemory(g_activeSweep);
+   g_hasActiveSweep   = false;
+   g_lastSetupSweep   = 0;
+   g_lastSetupBullish = false;
 
    // Phase 2: M1 structure engine for STH/STL hooks
    g_structureM1.Configure(_Symbol, PERIOD_M1, 3);
@@ -917,6 +921,7 @@ int OnInit()
    g_ipda.Compute();
    g_smt.Scan(PERIOD_H1, 100);
    g_lastD1BarTime = iTime(_Symbol, PERIOD_D1, 0);
+   g_lastH1BarTime = iTime(_Symbol, PERIOD_H1, 0);
 
    // Phase 5: Bind all entry models to the active symbol
    g_modelSB.SetSymbol(_Symbol);
@@ -938,7 +943,11 @@ void OnTick()
 {
    g_session.Refresh();
    g_risk.Refresh();
-   RefreshAnalysisEngines();
+
+   bool newBar = IsNewBar();
+   if(newBar)
+      RefreshAnalysisEngines();
+
    ICTSessionSnapshot session = g_session.Snapshot();
    g_bias.Refresh(session);
    g_risk.ManageOpenPositions(g_trade, g_structureM15, g_structureM5);
@@ -962,26 +971,23 @@ void OnTick()
       return;
    }
 
-   if(!IsNewBar())
+   if(!newBar)
       return;
 
    // Phase 6: Sweep-age / session invalidation of stale pending orders
    g_risk.ScanAndInvalidatePending(g_trade);
 
-   // Phase 7: Update IPDA and SMT on each new D1 bar
+   // Phase 7: Update IPDA on each new D1 bar
    {
       datetime d1Bar = iTime(_Symbol, PERIOD_D1, 0);
       if(d1Bar > 0 && d1Bar > g_lastD1BarTime)
       {
          g_lastD1BarTime = d1Bar;
          g_ipda.Compute();
-         g_smt.Scan(PERIOD_H1, 100);
          if(DrawZones)
          {
             SIPDARange     ipdaSnap = g_ipda.GetRange();
-            SSMTDivergence smtSnap  = g_smt.GetDivergence();
             g_visualizer.DrawIPDALevels(ipdaSnap);
-            g_visualizer.DrawSMTMarker(smtSnap);
             g_visualizer.DrawDOWPhaseLabel(bias.currentDOWPhase);
             // Judas Swing PO3 box (Phase 8)
             if(session.judasSM.detected)
@@ -1000,6 +1006,21 @@ void OnTick()
             SOpeningGap nwog = ComputeNWOG(_Symbol);
             g_visualizer.DrawNDOGLines(ndog);
             g_visualizer.DrawNWOGLines(nwog);
+         }
+      }
+   }
+
+   // Phase 7: Update SMT on each new H1 bar
+   {
+      datetime h1Bar = iTime(_Symbol, PERIOD_H1, 0);
+      if(h1Bar > 0 && h1Bar > g_lastH1BarTime)
+      {
+         g_lastH1BarTime = h1Bar;
+         g_smt.Scan(PERIOD_H1, 100);
+         if(DrawZones)
+         {
+            SSMTDivergence smtSnap = g_smt.GetDivergence();
+            g_visualizer.DrawSMTMarker(smtSnap);
          }
       }
    }
