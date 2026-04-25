@@ -239,6 +239,7 @@ void CICTRiskManager::ResetDay()
    m_snapshot.dayStartEquity = AccountInfoDouble(ACCOUNT_EQUITY);
    m_snapshot.dailyLossPct   = 0.0;
    m_snapshot.dailyBlocked   = false;
+   m_consecutiveLosses       = 0;
 }
 
 void CICTRiskManager::ResetWeek()
