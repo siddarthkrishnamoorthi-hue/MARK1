@@ -159,7 +159,7 @@ void CICTVisualizer::DrawOrderBlock(const ICTOrderBlockZone &zone, const string 
    ENUM_LINE_STYLE style = (zone.kind == ICT_OB_BREAKER) ? STYLE_DASH : STYLE_SOLID;
    DrawRectangle("OB_" + label + "_" + IntegerToString((int)zone.formedTime),
                  zone.formedTime,
-                 TimeCurrent(),
+                 TimeCurrent(),  // Chart X-axis uses server time; formedTime is server time too
                  zone.low,
                  zone.high,
                  blockColor,
@@ -174,7 +174,7 @@ void CICTVisualizer::DrawFVG(const ICTFVGZone &zone, const string label) const
    color gapColor = zone.bullish ? clrAqua : clrOrange;
    DrawRectangle("FVG_" + label + "_" + IntegerToString((int)zone.formedTime),
                  zone.formedTime,
-                 TimeCurrent(),
+                 TimeCurrent(),  // Chart X-axis uses server time; formedTime is server time too
                  zone.low,
                  zone.high,
                  gapColor,
@@ -188,7 +188,7 @@ void CICTVisualizer::DrawBPR(const ICTBPRZone &zone) const
 
    DrawRectangle("BPR_" + IntegerToString((int)zone.bullishFVGTime),
                  zone.bullishFVGTime,
-                 TimeCurrent(),
+                 TimeCurrent(),  // Chart X-axis uses server time; left edge is server time too
                  zone.low,
                  zone.high,
                  clrKhaki,

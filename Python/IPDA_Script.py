@@ -28,7 +28,6 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
     _HAVE_PLOT = True
 except ImportError:
     _HAVE_PLOT = False

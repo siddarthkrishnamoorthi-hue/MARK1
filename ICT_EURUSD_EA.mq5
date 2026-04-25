@@ -608,6 +608,38 @@ bool BuildSetupCandidate(const bool bullish,
    if(requirePostSweep && contextTime > 0)
       setup.confluenceScore++;
 
+   // Phase 7, Fix #4: IPDA gate and confluence.
+   // Price at IPDA equilibrium lacks directional edge — skip setup.
+   // Price at IPDA discount/premium adds institutional confluence.
+   {
+      SIPDARange ipdaRange = g_ipda.GetRange();
+      if(ipdaRange.equilibrium20 > 0.0)
+      {
+         double entryProxy = (setup.zoneLow + setup.zoneHigh) * 0.5;
+         if(MathAbs(entryProxy - ipdaRange.equilibrium20) <= PipSize() * 5.0)
+            return false; // At IPDA equilibrium — no directional edge
+         if(bullish && ipdaRange.low20 > 0.0 &&
+            MathAbs(entryProxy - ipdaRange.low20) <= PipSize() * 10.0)
+            setup.confluenceScore++; // At IPDA 20-bar discount — institutional accumulation zone
+         if(!bullish && ipdaRange.high20 > 0.0 &&
+            MathAbs(entryProxy - ipdaRange.high20) <= PipSize() * 10.0)
+            setup.confluenceScore++; // At IPDA 20-bar premium — institutional distribution zone
+      }
+   }
+
+   // Phase 7, Fix #5: SMT divergence confluence.
+   // Aligned SMT signal confirms institutional intent; opposing signal reduces edge.
+   {
+      SSMTDivergence smtDiv = g_smt.GetDivergence();
+      if(smtDiv.detected)
+      {
+         if((bullish && smtDiv.isBullishSMT) || (!bullish && smtDiv.isBearishSMT))
+            setup.confluenceScore++;  // Correlated divergence confirms direction
+         else if((bullish && smtDiv.isBearishSMT) || (!bullish && smtDiv.isBullishSMT))
+            setup.confluenceScore--;  // Opposing SMT reduces edge
+      }
+   }
+
    setup.sweepExtreme = SelectProtectiveExtreme(bullish,
                                                 (protectiveExtreme > 0.0)
                                                 ? protectiveExtreme

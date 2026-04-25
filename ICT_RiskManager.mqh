@@ -610,8 +610,8 @@ void CICTRiskManager::OnTradeTransaction(const MqlTradeTransaction &trans)
       rec.closePrice = HistoryDealGetDouble(trans.deal, DEAL_PRICE);
       rec.lotSize    = HistoryDealGetDouble(trans.deal, DEAL_VOLUME);
       rec.pnlDollars = closePnL;
-      rec.pnlPips    = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
-                       / MathMax(rec.lotSize, 0.01) / 10.0;
+      // Fix #7: pnlPips was DEAL_PROFIT/lotSize/10 (currency/lot ratio, not pip count).
+      // Correct calculation deferred until entryPrice is populated below.
       rec.modelName  = HistoryDealGetString(trans.deal, DEAL_COMMENT);
 
       // Populate entry fields from position history
@@ -631,6 +631,21 @@ void CICTRiskManager::OnTradeTransaction(const MqlTradeTransaction &trans)
             }
          }
          HistorySelect(TimeCurrent() - 604800, TimeCurrent() + 60);
+      }
+
+      // Fix #7: Extract tp2/tp3 from m_positionStates and compute correct pnlPips.
+      // m_positionStates is still valid at this point — CleanupStates runs after logging.
+      {
+         int stateIdx = FindPositionStateIndex(posId);
+         if(stateIdx >= 0)
+         {
+            rec.tp2 = m_positionStates[stateIdx].tp2;
+            rec.tp3 = m_positionStates[stateIdx].tp3;
+            bool bullish = m_positionStates[stateIdx].bullish;
+            if(m_pipSize > 0.0 && rec.entryPrice > 0.0 && rec.closePrice > 0.0)
+               rec.pnlPips = (rec.closePrice - rec.entryPrice) / m_pipSize
+                             * (bullish ? 1.0 : -1.0);
+         }
       }
       LogTradeToCSV(rec);
       return;

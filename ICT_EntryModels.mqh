@@ -367,18 +367,6 @@ public:
       double pipSize   = ((digits == 3 || digits == 5) ? pointSize * 10.0 : pointSize);
       double maxBreak  = pipSize * 10.0;  // ≤ 10 pips beyond 20-bar extreme
 
-      // Gate: IDM sweep (Phase 5, Item 7)
-      {
-         int guessDir = (ctx.bias.consensusBias == ICT_SESSION_BIAS_LONG_ONLY) ? -1 : 1; // fade direction
-         SInducementLevel idm;
-         if(!FindInducement(m_symbol, PERIOD_M15, guessDir, 20, idm) || !idm.isSwept)
-         {
-            Print("[MARK1][GATE][TS] IDM not swept -- rejected");
-            return false;
-         }
-         m_setup.idmSwept = true;
-      }
-
       // 20-bar high and low
       int h20Shift = (int)iHighest(m_symbol, PERIOD_M15, MODE_HIGH, 20, 2);
       int l20Shift = (int)iLowest (m_symbol, PERIOD_M15, MODE_LOW,  20, 2);
@@ -386,13 +374,36 @@ public:
       double l20 = iLow (m_symbol, PERIOD_M15, l20Shift);
 
       double lastHigh  = rates[1].high;
+      double lastLow   = rates[1].low;
       double lastClose = rates[1].close;
 
-      // Gate: IRL->ERL check (Phase 5, Item 8)
-      // Use current price as proxy since entry is at h20/l20 (range extreme = ERL candidate)
+      // Determine setup direction FIRST — TurtleSoup is a reversal model.
+      // BUG FIX: IDM gate was checked with guessed fade direction from consensus bias
+      // before the actual reversal setup was identified. Now we detect the setup first.
+      bool bearSetup = (lastHigh > h20 && lastHigh - h20 <= maxBreak && lastClose < h20);
+      bool bullSetup = (lastLow  < l20 && l20 - lastLow  <= maxBreak && lastClose > l20);
+
+      if(!bearSetup && !bullSetup) return false;
+      // Resolve rare conflict (price broke both extremes): prefer bullish reversal
+      if(bearSetup && bullSetup) bearSetup = false;
+
+      m_setup.bullish = bullSetup; // trade direction is the confirmed fade direction
+
+      // Gate: IDM sweep — use actual fade direction, not a guess from consensus bias
       {
-         bool bullishGuess   = (ctx.bias.consensusBias == ICT_SESSION_BIAS_LONG_ONLY);
-         SDOLTarget dolTarget = SelectDOLTarget(m_symbol, !bullishGuess, ctx.entryPrice); // fade direction
+         int dir = m_setup.bullish ? 1 : -1;
+         SInducementLevel idm;
+         if(!FindInducement(m_symbol, PERIOD_M15, dir, 20, idm) || !idm.isSwept)
+         {
+            Print("[MARK1][GATE][TS] IDM not swept -- rejected");
+            return false;
+         }
+         m_setup.idmSwept = true;
+      }
+
+      // Gate: IRL->ERL check (Phase 5, Item 8)
+      {
+         SDOLTarget dolTarget = SelectDOLTarget(m_symbol, m_setup.bullish, ctx.entryPrice);
          ENUM_LIQUIDITY_TYPE entryZone  = ClassifyLiquidityType(ctx.entryPrice, ctx.h4RangeHigh, ctx.h4RangeLow);
          ENUM_LIQUIDITY_TYPE targetZone = ClassifyLiquidityType(dolTarget.price,  ctx.h4RangeHigh, ctx.h4RangeLow);
          if(entryZone == LIQ_IRL && targetZone == LIQ_IRL)
@@ -402,11 +413,9 @@ public:
          }
       }
 
-      // Bearish Turtle Soup: price breaks above 20-bar high by ≤ 10 pips then rejection
-      if(lastHigh > h20 && lastHigh - h20 <= maxBreak && lastClose < h20)
+      if(bearSetup)
       {
          m_setup.valid    = true;
-         m_setup.bullish  = false;
          m_setup.entry    = h20;
          m_setup.stopLoss = lastHigh + pipSize * 10.0;
          double riskDist  = MathAbs(m_setup.entry - m_setup.stopLoss);
@@ -418,24 +427,17 @@ public:
          return true;
       }
 
-      double lastLow = rates[1].low;
-      // Bullish Turtle Soup: price breaks below 20-bar low by ≤ 10 pips then rejection
-      if(lastLow < l20 && l20 - lastLow <= maxBreak && lastClose > l20)
-      {
-         m_setup.valid    = true;
-         m_setup.bullish  = true;
-         m_setup.entry    = l20;
-         m_setup.stopLoss = lastLow - pipSize * 10.0;
-         double riskDist  = MathAbs(m_setup.entry - m_setup.stopLoss);
-         m_setup.tp1      = m_setup.entry + riskDist;
-         m_setup.tp2      = m_setup.entry + riskDist * 2.0;
-         SDOLTarget dol   = SelectDOLTarget(m_symbol, true, m_setup.entry);
-         m_setup.tp3      = (dol.type != DOL_NONE) ? dol.price : h20;
-         Print("[MARK1][TS] Bullish Turtle Soup: entry=", m_setup.entry);
-         return true;
-      }
-
-      return false;
+      // bullSetup is true here
+      m_setup.valid    = true;
+      m_setup.entry    = l20;
+      m_setup.stopLoss = lastLow - pipSize * 10.0;
+      double riskDist  = MathAbs(m_setup.entry - m_setup.stopLoss);
+      m_setup.tp1      = m_setup.entry + riskDist;
+      m_setup.tp2      = m_setup.entry + riskDist * 2.0;
+      SDOLTarget dol   = SelectDOLTarget(m_symbol, true, m_setup.entry);
+      m_setup.tp3      = (dol.type != DOL_NONE) ? dol.price : h20;
+      Print("[MARK1][TS] Bullish Turtle Soup: entry=", m_setup.entry);
+      return true;
    }
 
    virtual STradeSetup GetSetup() { return m_setup; }

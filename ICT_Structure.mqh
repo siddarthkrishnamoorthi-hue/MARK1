@@ -139,6 +139,7 @@ private:
    MqlRates        m_rates[];
    ICTSwingPoint   m_swingHighs[];
    ICTSwingPoint   m_swingLows[];
+   datetime        m_lastBar0Time;  ///< Time of bar[0] at previous Refresh() — enables incremental scan
 
    bool   IsValidIndex(const int index) const;
    bool   IsSwingHigh(const int index) const;
@@ -169,6 +170,7 @@ CICTStructureEngine::CICTStructureEngine()
    m_timeframe     = PERIOD_CURRENT;
    m_swingStrength = 3;
    m_pointSize     = _Point;
+   m_lastBar0Time  = 0;
    ArraySetAsSeries(m_rates, true);
    ResetState();
 }
@@ -181,6 +183,7 @@ void CICTStructureEngine::Configure(const string symbol, const ENUM_TIMEFRAMES t
    m_pointSize     = SymbolInfoDouble(symbol, SYMBOL_POINT);
    if(m_pointSize <= 0.0)
       m_pointSize = _Point;
+   m_lastBar0Time = 0;  // Force full rescan after reconfiguration
 }
 
 void CICTStructureEngine::ResetState()
@@ -307,7 +310,16 @@ bool CICTStructureEngine::GetLatestClosedBar(MqlRates &bar) const
 
 bool CICTStructureEngine::Refresh(const int barsToLoad)
 {
-   ResetState();
+   // ── Same-bar gate: if the bar hasn't changed, state is current ──
+   // Skips CopyRates entirely — handles callers without external bar-change gates
+   // (e.g. RefreshAnalysisEngines calls H4/H1 engines every M1 bar).
+   if(m_lastBar0Time > 0
+      && (ArraySize(m_swingHighs) > 0 || ArraySize(m_swingLows) > 0))
+   {
+      datetime quickCheck = iTime(m_symbol, m_timeframe, 0);
+      if(quickCheck > 0 && quickCheck == m_lastBar0Time)
+         return true;
+   }
 
    int requiredBars = MathMax(barsToLoad, (m_swingStrength * 2) + 20);
    int copied = CopyRates(m_symbol, m_timeframe, 0, requiredBars, m_rates);
@@ -316,34 +328,154 @@ bool CICTStructureEngine::Refresh(const int barsToLoad)
 
    ArraySetAsSeries(m_rates, true);
 
-   int oldestEligible = copied - 1 - m_swingStrength;
-   for(int index = oldestEligible; index >= m_swingStrength; index--)
+   datetime currentBar0 = m_rates[0].time;
+
+   int  oldestEligible = copied - 1 - m_swingStrength;
+   bool haveAny        = false;
+   bool lastWasHigh    = false;
+   int  scanFrom       = oldestEligible;
+   bool fullScan       = true;
+
+   // ── Incremental path: only rescan the frontier zone ──
+   // When few new bars have formed, keep stable swings intact and only
+   // process the newly confirmable bars (those that were within m_swingStrength
+   // of the newest bar at the previous scan and now have enough right-side bars).
+   if(m_lastBar0Time > 0 && currentBar0 > m_lastBar0Time
+      && (ArraySize(m_swingHighs) > 0 || ArraySize(m_swingLows) > 0))
    {
-      if(IsSwingHigh(index))
+      // Count new bars since last refresh
+      int newBars = 0;
+      for(int b = 0; b < copied; b++)
       {
-         ICTSwingPoint swingHigh;
-         swingHigh.valid          = true;
-         swingHigh.isHigh         = true;
-         swingHigh.barShift       = index;
-         swingHigh.time           = m_rates[index].time;
-         swingHigh.price          = m_rates[index].high;
-         swingHigh.classification = ClassifyHigh(swingHigh.price);
-         AppendSwing(m_swingHighs, swingHigh);
+         if(m_rates[b].time <= m_lastBar0Time)
+         { newBars = b; break; }
       }
 
-      if(IsSwingLow(index))
+      if(newBars > 0 && newBars <= m_swingStrength * 3)
       {
-         ICTSwingPoint swingLow;
-         swingLow.valid          = true;
-         swingLow.isHigh         = false;
-         swingLow.barShift       = index;
-         swingLow.time           = m_rates[index].time;
-         swingLow.price          = m_rates[index].low;
-         swingLow.classification = ClassifyLow(swingLow.price);
-         AppendSwing(m_swingLows, swingLow);
+         // Frontier = bars at barShift [m_swingStrength .. m_swingStrength + newBars]
+         int frontierOldest = MathMin(m_swingStrength + newBars, oldestEligible);
+         datetime frontierTime = m_rates[frontierOldest].time;
+
+         // Strip swings in frontier zone — they'll be re-detected
+         while(ArraySize(m_swingHighs) > 0
+               && m_swingHighs[ArraySize(m_swingHighs) - 1].time >= frontierTime)
+            ArrayResize(m_swingHighs, ArraySize(m_swingHighs) - 1);
+         while(ArraySize(m_swingLows) > 0
+               && m_swingLows[ArraySize(m_swingLows) - 1].time >= frontierTime)
+            ArrayResize(m_swingLows, ArraySize(m_swingLows) - 1);
+
+         // Recover alternation state from the most recent stable swing
+         datetime lastHT = (ArraySize(m_swingHighs) > 0)
+                           ? m_swingHighs[ArraySize(m_swingHighs) - 1].time : 0;
+         datetime lastLT = (ArraySize(m_swingLows) > 0)
+                           ? m_swingLows[ArraySize(m_swingLows) - 1].time : 0;
+
+         if(lastHT > 0 || lastLT > 0)
+         {
+            haveAny     = true;
+            lastWasHigh = (lastHT > lastLT);
+         }
+
+         scanFrom = frontierOldest;
+         fullScan = false;
       }
    }
 
+   if(fullScan)
+      ResetState();
+
+   // BUG FIX #1 — Alternation enforcement: swings must alternate H→L→H→L.
+   // Consecutive same-type swings collapse into the more extreme one.
+   // BUG FIX #2 — Classification context: when a same-type swing is replaced by a
+   // more extreme one, re-classify it against the prior confirmed swing of the same type.
+   for(int index = scanFrom; index >= m_swingStrength; index--)
+   {
+      bool isHigh = IsSwingHigh(index);
+      bool isLow  = IsSwingLow(index);
+
+      // Resolve conflict: same bar qualifies as both — prefer opposite of last accepted
+      if(isHigh && isLow)
+      {
+         if(haveAny && lastWasHigh) isHigh = false;
+         else                       isLow  = false;
+      }
+
+      if(isHigh)
+      {
+         if(!haveAny || !lastWasHigh)
+         {
+            // Valid: first swing or correct alternation (low→high)
+            ICTSwingPoint sp;
+            sp.valid          = true;
+            sp.isHigh         = true;
+            sp.barShift       = index;
+            sp.time           = m_rates[index].time;
+            sp.price          = m_rates[index].high;
+            sp.classification = ClassifyHigh(sp.price);
+            AppendSwing(m_swingHighs, sp);
+            lastWasHigh = true;
+            haveAny     = true;
+         }
+         else
+         {
+            // Consecutive high — keep only the more extreme (higher) one
+            int lastIdx = ArraySize(m_swingHighs) - 1;
+            if(m_rates[index].high > m_swingHighs[lastIdx].price)
+            {
+               m_swingHighs[lastIdx].barShift = index;
+               m_swingHighs[lastIdx].time     = m_rates[index].time;
+               m_swingHighs[lastIdx].price    = m_rates[index].high;
+               // Re-classify against the prior confirmed high
+               if(lastIdx > 0)
+               {
+                  double priorPrice = m_swingHighs[lastIdx - 1].price;
+                  double eps        = MathMax(m_pointSize * 0.5, 0.00000001);
+                  m_swingHighs[lastIdx].classification =
+                     (m_rates[index].high > priorPrice + eps) ? ICT_SWING_HH : ICT_SWING_LH;
+               }
+            }
+         }
+      }
+      else if(isLow)
+      {
+         if(!haveAny || lastWasHigh)
+         {
+            // Valid: first swing or correct alternation (high→low)
+            ICTSwingPoint sp;
+            sp.valid          = true;
+            sp.isHigh         = false;
+            sp.barShift       = index;
+            sp.time           = m_rates[index].time;
+            sp.price          = m_rates[index].low;
+            sp.classification = ClassifyLow(sp.price);
+            AppendSwing(m_swingLows, sp);
+            lastWasHigh = false;
+            haveAny     = true;
+         }
+         else
+         {
+            // Consecutive low — keep only the more extreme (lower) one
+            int lastIdx = ArraySize(m_swingLows) - 1;
+            if(m_rates[index].low < m_swingLows[lastIdx].price)
+            {
+               m_swingLows[lastIdx].barShift = index;
+               m_swingLows[lastIdx].time     = m_rates[index].time;
+               m_swingLows[lastIdx].price    = m_rates[index].low;
+               // Re-classify against the prior confirmed low
+               if(lastIdx > 0)
+               {
+                  double priorPrice = m_swingLows[lastIdx - 1].price;
+                  double eps        = MathMax(m_pointSize * 0.5, 0.00000001);
+                  m_swingLows[lastIdx].classification =
+                     (m_rates[index].low > priorPrice + eps) ? ICT_SWING_HL : ICT_SWING_LL;
+               }
+            }
+         }
+      }
+   }
+
+   m_lastBar0Time = currentBar0;
    return (ArraySize(m_swingHighs) > 0 || ArraySize(m_swingLows) > 0);
 }
 
