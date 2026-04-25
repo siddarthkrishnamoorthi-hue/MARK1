@@ -93,6 +93,13 @@ private:
    CICTStructureEngine  m_biasStructure;
    CICTStructureEngine  m_trendStructure;
    CICTStructureEngine  m_directionStructure;
+   CICTStructureEngine  m_weeklyStructure;   ///< Fix #6: W1 structure for weekly bias
+   CICTStructureEngine  m_monthlyStructure;  ///< Fix #6: MN1 structure for monthly bias
+   datetime             m_lastD1BarTime;     ///< Bar-change gate: avoid tick-spam CopyRates on D1
+   datetime             m_lastH4BarTime;     ///< Bar-change gate: avoid tick-spam CopyRates on H4
+   datetime             m_lastH1BarTime;     ///< Bar-change gate: avoid tick-spam CopyRates on H1
+   datetime             m_lastW1BarTime;     ///< Bar-change gate: avoid tick-spam CopyRates on W1
+   datetime             m_lastMN1BarTime;    ///< Bar-change gate: avoid tick-spam CopyRates on MN1
    ICTBiasSnapshot      m_snapshot;
 
    ENUM_ICT_SESSION_BIAS ResolveFromStructure(const ICTStructureSnapshot &snapshot) const;
@@ -126,6 +133,11 @@ CICTBiasEngine::CICTBiasEngine()
    m_biasTimeframe      = PERIOD_D1;
    m_trendTimeframe     = PERIOD_H4;
    m_directionTimeframe = PERIOD_H1;
+   m_lastD1BarTime      = 0;
+   m_lastH4BarTime      = 0;
+   m_lastH1BarTime      = 0;
+   m_lastW1BarTime      = 0;
+   m_lastMN1BarTime     = 0;
    ZeroMemory(m_snapshot);
 }
 
@@ -146,6 +158,9 @@ void CICTBiasEngine::Configure(const string symbol,
    m_biasStructure.Configure(m_symbol, m_biasTimeframe, m_swingStrength);
    m_trendStructure.Configure(m_symbol, m_trendTimeframe, m_swingStrength);
    m_directionStructure.Configure(m_symbol, m_directionTimeframe, m_swingStrength);
+   // Fix #6: W1 and MN1 use swingStrength≥2 — monthly bars are inherently slow-forming
+   m_weeklyStructure.Configure(m_symbol, PERIOD_W1, MathMax(m_swingStrength, 2));
+   m_monthlyStructure.Configure(m_symbol, PERIOD_MN1, MathMax(m_swingStrength, 2));
 }
 
 ENUM_ICT_SESSION_BIAS CICTBiasEngine::ResolveFromStructure(const ICTStructureSnapshot &snapshot) const
@@ -231,9 +246,45 @@ bool CICTBiasEngine::Refresh(const ICTSessionSnapshot &session)
    m_snapshot.time   = session.gmtTime;
    m_snapshot.symbol = m_symbol;
 
-   m_biasStructure.Refresh(300);
-   m_trendStructure.Refresh(300);
-   m_directionStructure.Refresh(300);
+   // Bar-change gates: only refresh each structure when its timeframe bar changes.
+   // Avoids redundant CopyRates(300) calls on every tick.
+   {
+      datetime d1Bar = iTime(m_symbol, m_biasTimeframe, 0);
+      if(d1Bar > 0 && d1Bar != m_lastD1BarTime)
+      {
+         m_lastD1BarTime = d1Bar;
+         m_biasStructure.Refresh(300);
+      }
+      datetime h4Bar = iTime(m_symbol, m_trendTimeframe, 0);
+      if(h4Bar > 0 && h4Bar != m_lastH4BarTime)
+      {
+         m_lastH4BarTime = h4Bar;
+         m_trendStructure.Refresh(300);
+      }
+      datetime h1Bar = iTime(m_symbol, m_directionTimeframe, 0);
+      if(h1Bar > 0 && h1Bar != m_lastH1BarTime)
+      {
+         m_lastH1BarTime = h1Bar;
+         m_directionStructure.Refresh(300);
+      }
+   }
+
+   // Fix #6: W1/MN1 only refresh when a new bar forms (once/week and once/month).
+   // Avoids unnecessary CopyRates overhead on every tick.
+   {
+      datetime w1Bar = iTime(m_symbol, PERIOD_W1, 0);
+      if(w1Bar > 0 && w1Bar != m_lastW1BarTime)
+      {
+         m_lastW1BarTime = w1Bar;
+         m_weeklyStructure.Refresh(100);
+      }
+      datetime mn1Bar = iTime(m_symbol, PERIOD_MN1, 0);
+      if(mn1Bar > 0 && mn1Bar != m_lastMN1BarTime)
+      {
+         m_lastMN1BarTime = mn1Bar;
+         m_monthlyStructure.Refresh(60);
+      }
+   }
 
    ICTStructureSnapshot trendSnapshot;
    ICTStructureSnapshot directionSnapshot;
@@ -296,22 +347,30 @@ bool CICTBiasEngine::AllowsTrade(const bool bullish) const
    return bullish ? m_snapshot.longAllowed : m_snapshot.shortAllowed;
 }
 
-/// @brief Resolves weekly directional bias from PERIOD_W1 structure.
+/// @brief Resolves weekly bias from W1 swing structure (HH+HL=bullish, LH+LL=bearish).
+/// Fix #6: replaced single W1 candle body-direction with proper ICT structural bias.
 ENUM_ICT_SESSION_BIAS CICTBiasEngine::ResolveWeeklyBias() const
 {
-   double wClose = iClose(m_symbol, PERIOD_W1, 1);
-   double wOpen  = iOpen (m_symbol, PERIOD_W1, 1);
-   if(wClose <= 0.0 || wOpen <= 0.0) return ICT_SESSION_BIAS_NEUTRAL;
-   return (wClose > wOpen) ? ICT_SESSION_BIAS_LONG_ONLY : ICT_SESSION_BIAS_SHORT_ONLY;
+   ICTStructureSnapshot snapshot;
+   ZeroMemory(snapshot);
+   if(!m_weeklyStructure.BuildSnapshot(snapshot))
+      return ICT_SESSION_BIAS_NEUTRAL;
+   if(snapshot.bias == ICT_BIAS_RANGE)
+      return ICT_SESSION_BIAS_NEUTRAL;
+   return ResolveFromStructure(snapshot);
 }
 
-/// @brief Resolves monthly directional bias from PERIOD_MN1 structure.
+/// @brief Resolves monthly bias from MN1 swing structure (HH+HL=bullish, LH+LL=bearish).
+/// Fix #6: replaced single MN1 candle body-direction with proper ICT structural bias.
 ENUM_ICT_SESSION_BIAS CICTBiasEngine::ResolveMonthlyBias() const
 {
-   double mClose = iClose(m_symbol, PERIOD_MN1, 1);
-   double mOpen  = iOpen (m_symbol, PERIOD_MN1, 1);
-   if(mClose <= 0.0 || mOpen <= 0.0) return ICT_SESSION_BIAS_NEUTRAL;
-   return (mClose > mOpen) ? ICT_SESSION_BIAS_LONG_ONLY : ICT_SESSION_BIAS_SHORT_ONLY;
+   ICTStructureSnapshot snapshot;
+   ZeroMemory(snapshot);
+   if(!m_monthlyStructure.BuildSnapshot(snapshot))
+      return ICT_SESSION_BIAS_NEUTRAL;
+   if(snapshot.bias == ICT_BIAS_RANGE)
+      return ICT_SESSION_BIAS_NEUTRAL;
+   return ResolveFromStructure(snapshot);
 }
 
 /// @brief Returns the ICT-mapped DOW phase for a given GMT timestamp.
