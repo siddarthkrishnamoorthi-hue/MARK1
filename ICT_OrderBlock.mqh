@@ -97,7 +97,7 @@ bool CICTOrderBlockEngine::LoadRates(const int count, MqlRates &rates[]) const
 {
    ArraySetAsSeries(rates, true);
    int copied = CopyRates(m_symbol, m_timeframe, 0, count, rates);
-   return (copied > 20);
+   return (copied >= count);
 }
 
 bool CICTOrderBlockEngine::IsBullishDisplacement(const MqlRates &rates[], const int shift) const
@@ -150,7 +150,7 @@ bool CICTOrderBlockEngine::FindLatestOrderBlock(const bool bullish, ICTOrderBloc
    if(!LoadRates(m_lookbackBars + 20, rates))
       return false;
 
-   for(int shift = m_lookbackBars; shift >= 5; shift--)
+   for(int shift = 5; shift <= m_lookbackBars; shift++)
    {
       bool candidate = bullish ? (rates[shift].close < rates[shift].open) : (rates[shift].close > rates[shift].open);
       if(!candidate)
@@ -166,9 +166,8 @@ bool CICTOrderBlockEngine::FindLatestOrderBlock(const bool bullish, ICTOrderBloc
       zone.kind       = ICT_OB_STANDARD;
       zone.sourceShift= shift;
       zone.formedTime = rates[shift].time;
-      // ICT OB uses candle body, not wicks
-      zone.low        = MathMin(rates[shift].open, rates[shift].close);
-      zone.high       = MathMax(rates[shift].open, rates[shift].close);
+      zone.low        = rates[shift].low;
+      zone.high       = rates[shift].high;
       FinalizeZone(zone);
       zone.invalidated= false;
       zone.mitigated  = false;
@@ -400,7 +399,7 @@ bool FindVacuumBlock(const string symbol,
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
    int copied = CopyRates(symbol, tf, 0, lookback + 5, rates);
-   if(copied < 5) return false;
+   if(copied < lookback + 5) return false;
 
    double pointSize = SymbolInfoDouble(symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
