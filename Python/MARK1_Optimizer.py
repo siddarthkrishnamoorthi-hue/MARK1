@@ -16,10 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
-import os
-import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -197,10 +194,11 @@ def main() -> None:
     if not connected:
         print("[WARN] Running without live MT5 connection — backtest stubs will return zeros.")
 
-    optimize(args.set, args.report, symbol=args.symbol)
-
-    if connected and _HAVE_MT5:
-        mt5.shutdown()
+    try:
+        optimize(args.set, args.report, symbol=args.symbol)
+    finally:
+        if connected and _HAVE_MT5:
+            mt5.shutdown()
 
 
 if __name__ == "__main__":
