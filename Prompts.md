@@ -27,3 +27,7 @@ the final push for my EA is narrative + context + execution timing, “structure
 - Python unused imports cleaned (Analytics, Optimizer, IPDA, SMT).
 - MT5 shutdown wrapped in try/finally (Optimizer).
 - Dead MARK1_Funded.set MagicNumber line removed.
+
+https://github.com/darula-hpp/ict-ea.git
+https://github.com/llihcchill/ICT-Imbalance-Expert-Advisor.git
+https://github.com/KVignesh122/MT5-SMC-trading-bot.git
