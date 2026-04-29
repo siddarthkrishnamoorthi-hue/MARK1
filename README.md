@@ -365,3 +365,402 @@ See [instructions.md](instructions.md) §11 for detailed usage of each script.
 | v3.0 | Phase 1–6 — full ICT concept suite, entry models, risk hardening |
 | **v4.0** | Phase 7–9 — IPDA engine, SMT divergence, visualizer layer, Python suite; all compile errors resolved |
 | **v4.1** | Enhancement session — swing alternation enforcement (H→L→H→L), W1/MN1 structure-based bias, IPDA equilibrium gate + discount/premium confluence, SMT confluence scoring, TurtleSoup IDM direction fix, RiskManager CSV pnlPips/tp2/tp3 fix, Visualizer TimeGMT consistency, W1/MN1 bar-change performance gate |
+
+
+You are an expert MQL5 developer and quantitative forex strategist. 
+Your task is to build a complete, production-grade Expert Advisor for 
+MetaTrader 5 from absolute scratch. The EA is named RONIN. Every single 
+step — architecture, logic, risk management, testing, and optimization — 
+must be completed to the highest professional standard.
+
+Do not use any third-party libraries. Do not use any indicators. 
+Pure price action and OHLC data only. No code smells. No plagiarism. 
+No copy-paste patterns. Write every function clean, minimal, and purposeful.
+
+══════════════════════════════════════════════
+EA IDENTITY
+══════════════════════════════════════════════
+
+Name        : RONIN
+Version     : 1.0
+Symbol      : GBPUSD
+Timeframe   : M15
+Concept     : London Session Asian Range Breakout + Retest Confirmation
+Philosophy  : Wait in silence during Asia. Strike at London open. 
+              Confirm the retest before committing. One clean trade per day.
+
+══════════════════════════════════════════════
+STRATEGY LOGIC — COMPLETE SPECIFICATION
+══════════════════════════════════════════════
+
+PHASE 1 — ASIAN RANGE CAPTURE (00:00 – 07:00 GMT)
+- Every trading day, at candle close, scan all M15 candles between 
+  00:00 GMT and 07:00 GMT.
+- Record:
+    AsianHigh = highest high across all M15 candles in that window
+    AsianLow  = lowest low across all M15 candles in that window
+    AsianRange = AsianHigh - AsianLow (in pips)
+- Store these values globally. Reset at the start of each new GMT day.
+
+PHASE 2 — RANGE FILTER
+- If AsianRange < MinRangePips (input, default 15 pips): skip the day. 
+  Too tight = noise, not a real session range.
+- If AsianRange > MaxRangePips (input, default 80 pips): skip the day. 
+  Too wide = abnormal event, spread risk.
+
+PHASE 3 — BREAKOUT DETECTION (07:00 – 12:00 GMT only)
+- At each M15 candle close after 07:00 GMT:
+    BullishBreakout: candle closes ABOVE (AsianHigh + BreakoutBuffer pips)
+    BearishBreakout: candle closes BELOW (AsianLow - BreakoutBuffer pips)
+  where BreakoutBuffer (input, default 3 pips) prevents shadow fakeouts.
+- On first valid breakout candle close, set a flag:
+    BreakoutDirection = LONG or SHORT
+    BreakoutLevel = AsianHigh or AsianLow accordingly
+    BreakoutTime = current candle close time
+- Only one breakout direction is tracked per day. First one wins.
+- If time passes 12:00 GMT and no breakout has triggered: mark day as 
+  NO_TRADE, do nothing.
+
+PHASE 4 — RETEST DETECTION
+- After breakout is flagged, begin watching for a retest:
+    For LONG: price must return to within RetestZonePips (input, 
+    default 8 pips) ABOVE the BreakoutLevel.
+    For SHORT: price must return to within RetestZonePips BELOW 
+    the BreakoutLevel.
+- Retest must happen within RetestTimeoutCandles (input, default 12 
+  M15 candles = 3 hours) after breakout candle. If it doesn't, 
+  cancel and mark day NO_TRADE.
+- Retest must NOT close back inside the Asian range. If price closes 
+  back inside the Asian range during retest, it is a false breakout — 
+  cancel the day, no trade.
+
+PHASE 5 — REJECTION CANDLE CONFIRMATION
+- Once price touches the retest zone, wait for a M15 candle to close 
+  with a valid rejection pattern. Evaluate using pure OHLC:
+
+  For LONG (retest of broken Asian High as new support):
+    Condition A — Bullish Engulfing:
+      current close > current open (bullish body)
+      current open <= previous close
+      current close >= previous open
+    Condition B — Pin Bar / Hammer:
+      lower_wick = open - low (if bearish body) or close - low (if bullish)
+      body = abs(close - open)
+      lower_wick >= 2.0 * body
+      close in upper 40% of candle range
+
+  For SHORT (retest of broken Asian Low as new resistance):
+    Mirror conditions — Bearish Engulfing or Shooting Star.
+
+  If neither condition is met within the retest zone, wait up to 
+  RetestTimeoutCandles. If still no valid pattern, cancel day.
+
+PHASE 6 — ENTRY
+- Entry: Market order at the CLOSE of the rejection candle.
+  Use OrderSend with ORDER_TYPE_BUY or ORDER_TYPE_SELL.
+- No pending orders. Market execution only.
+- Entry is in the direction of the original breakout.
+
+PHASE 7 — STOP LOSS
+- SL for LONG : BreakoutLevel - SLBufferPips (input, default 12 pips)
+  but also check: SL must not be wider than MaxSLPips (input, default 
+  25 pips). If it is, skip the trade.
+- SL for SHORT: BreakoutLevel + SLBufferPips
+- Hard coded SL on every order. No trade without SL ever.
+
+PHASE 8 — TAKE PROFIT
+- TP = Entry ± (AsianRange * RRMultiplier)
+  where RRMultiplier (input, default 1.8)
+- This creates a measured-move TP proportional to the day's range.
+- Also set a secondary TP: MaxTPPips (input, default 80 pips). 
+  TP is the lesser of measured-move TP and MaxTPPips.
+
+PHASE 9 — TRADE MANAGEMENT (BREAKEVEN + PARTIAL EXIT)
+- Breakeven trigger: when price moves BreakevenTriggerPips 
+  (input, default 20 pips) in profit, move SL to entry + 1 pip 
+  (for LONG) or entry - 1 pip (for SHORT). Do this once per trade.
+- Partial close: when price hits 50% of TP distance, close 50% of 
+  the position and trail the remaining 50% with a TrailingStopPips 
+  (input, default 15 pips) trailing SL.
+- Use ModifyOrder / PositionModify for SL adjustments.
+
+PHASE 10 — TIME EXIT
+- If the trade is still open at 17:00 GMT, close it at market price. 
+  No overnight holding. Use a time-based forced close check on every tick.
+
+══════════════════════════════════════════════
+RISK MANAGEMENT — NON-NEGOTIABLE
+══════════════════════════════════════════════
+
+POSITION SIZING:
+- Risk % per trade: RiskPercent (input, default 1.0%)
+- Lot = (AccountBalance * RiskPercent / 100) / (SL_pips * PipValue)
+- PipValue must be dynamically calculated for GBPUSD using 
+  SymbolInfoDouble(). Never hardcode pip value.
+- Lot must be rounded down to nearest lot step using SymbolInfoDouble 
+  SYMBOL_VOLUME_STEP.
+- Lot must not exceed MaxLot (input, default 1.0) as a safety cap.
+- Lot must not be below MinLot (SymbolInfoDouble SYMBOL_VOLUME_MIN).
+
+DAILY LOSS CIRCUIT BREAKER:
+- Track DailyPnL = sum of all closed trade profits today.
+- If DailyPnL falls below -DailyLossLimitPercent (input, default 2.0%) 
+  of balance at day start, stop trading for the rest of that GMT day. 
+  No new orders.
+
+MAX DRAWDOWN MONITOR:
+- Calculate running drawdown = (PeakEquity - CurrentEquity) / 
+  PeakEquity * 100.
+- If drawdown exceeds MaxDrawdownPercent (input, default 10%): 
+  pause ALL trading until drawdown recovers below HalfOfMaxDrawdown. 
+  Log a warning to the Experts tab.
+
+ONE TRADE PER DAY:
+- Strict one trade per day maximum. Use a boolean DayTraded flag 
+  reset on each new GMT day.
+
+SPREAD FILTER:
+- Before entry, check current spread: if spread > MaxSpreadPips 
+  (input, default 3 pips for GBPUSD), do not enter. Skip the trade.
+
+══════════════════════════════════════════════
+CODE ARCHITECTURE
+══════════════════════════════════════════════
+
+STRUCTURE:
+- One .mq5 file. No includes from external sources.
+- Modular functions. One responsibility per function. No function 
+  over 40 lines.
+- Use enum for states: 
+    enum RONIN_STATE { WAITING_RANGE, WAITING_BREAKOUT, 
+                       WAITING_RETEST, WAITING_REJECTION, 
+                       IN_TRADE, DAY_DONE }
+- Global state machine: RONIN_STATE CurrentState
+- All input parameters grouped at the top with clear comments.
+- All magic numbers as named constants or inputs. No raw numbers 
+  in logic code.
+
+REQUIRED FUNCTIONS (minimum):
+  OnInit()           — initialization, validation, symbol checks
+  OnTick()           — main state machine router
+  OnDeinit()         — cleanup
+  CaptureAsianRange()        — Phase 1-2 logic
+  DetectBreakout()           — Phase 3 logic
+  DetectRetest()             — Phase 4 logic  
+  IsRejectionCandle()        — Phase 5 OHLC pattern check, returns bool
+  ExecuteEntry()             — Phase 6-8 order execution
+  ManageTrade()              — Phase 9 breakeven and partial close
+  CheckTimeExit()            — Phase 10 forced close
+  CalculateLotSize()         — risk-based lot calculation
+  CheckDailyCircuitBreaker() — daily loss limit
+  CheckDrawdownBreaker()     — max drawdown monitor
+  ResetDailyState()          — reset all daily flags at new GMT day
+  GmtHour()                  — helper: return current GMT hour
+  GmtMinute()                — helper: return current GMT minute
+  PipsToPrice()              — helper: convert pips to price distance
+  PriceToPips()              — helper: convert price distance to pips
+  IsNewDay()                 — helper: detect new GMT day
+  LogStatus()                — print current state to Experts tab
+
+VARIABLE NAMING:
+- PascalCase for globals and inputs.
+- camelCase for locals inside functions.
+- All prices stored as double with sufficient precision.
+- All pip values computed, never hardcoded.
+
+ERROR HANDLING:
+- Check return value of every OrderSend call. Log error code if failed.
+- Check ChartSymbol and Period in OnInit. Warn if wrong symbol/TF.
+- If PositionModify fails, log and retry on next tick with a counter 
+  (max 3 retries, then give up and log).
+- All array accesses bounds-checked.
+
+COMMENTS:
+- Every function has a header comment: what it does, inputs, outputs.
+- Complex calculations explained inline.
+- No dead code. No commented-out blocks.
+
+══════════════════════════════════════════════
+BACKTESTING PROTOCOL
+══════════════════════════════════════════════
+
+MINIMUM REQUIRED BACKTEST:
+- Symbol   : GBPUSD
+- Timeframe: M15
+- Data     : Every tick based on real ticks (highest quality in MT5 
+             Strategy Tester)
+- Period   : January 2013 – December 2024 (minimum 11 years)
+- Spread   : Use variable spread (real spread simulation)
+- Initial deposit: $10,000
+- Commission: set to your broker's actual commission per lot
+
+WHAT TO RECORD FROM BACKTEST:
+  Net Profit
+  Profit Factor (target: > 1.4)
+  Win Rate (target: 52–65%)
+  Max Drawdown % (target: < 15%)
+  Max Drawdown $ amount
+  Total Trades (should be 1000+ over 11 years for statistical validity)
+  Average trade duration
+  Average Win / Average Loss ratio
+  Consecutive losses max (tells you risk of ruin)
+  Recovery Factor = Net Profit / Max Drawdown (target: > 2.0)
+  Sharpe Ratio (target: > 0.5)
+
+Run the 11-year backtest first with DEFAULT settings before any 
+optimization to establish the baseline.
+
+WALK-FORWARD VALIDATION:
+  Split data into:
+    In-Sample   : Jan 2013 – Dec 2019 (7 years) — optimize here
+    Out-of-Sample: Jan 2020 – Dec 2024 (5 years) — validate here
+  The strategy must be profitable on BOTH segments independently.
+  If out-of-sample results are dramatically worse than in-sample, 
+  the strategy is overfit. Start over with less aggressive optimization.
+
+══════════════════════════════════════════════
+OPTIMIZATION PROTOCOL (after baseline backtest)
+══════════════════════════════════════════════
+
+Use MT5 Genetic Optimization. Optimize ONE parameter group at a time.
+Never optimize everything simultaneously — that guarantees overfitting.
+
+ROUND 1 — Range Filters:
+  MinRangePips     : 10 to 25, step 5
+  MaxRangePips     : 60 to 100, step 10
+  Optimize for: Profit Factor
+
+ROUND 2 — Breakout / Retest Parameters:
+  BreakoutBuffer   : 2 to 8, step 1
+  RetestZonePips   : 5 to 15, step 2
+  RetestTimeoutCandles: 8 to 16, step 2
+  SLBufferPips     : 8 to 18, step 2
+  Optimize for: Recovery Factor
+
+ROUND 3 — Risk/Reward:
+  RRMultiplier     : 1.2 to 2.5, step 0.1
+  BreakevenTriggerPips: 15 to 30, step 5
+  TrailingStopPips : 10 to 25, step 5
+  Optimize for: Net Profit with Drawdown < 15% constraint
+
+OPTIMIZATION RULES:
+- Reject any parameter set that has fewer than 800 trades over 7 years.
+- Reject any parameter set where Max Drawdown > 20%.
+- Reject any parameter set where Profit Factor < 1.3.
+- From the passing sets, pick the one with the highest Recovery Factor,
+  not the highest net profit. Chasing highest profit = overfitting.
+- After selecting best params, re-run full 11-year backtest to confirm.
+
+ROBUSTNESS CHECKS (run these after optimization):
+1. Spread stress test: increase MaxSpreadPips to 5. Run full backtest. 
+   Strategy must remain profitable.
+2. Slippage test: add 2 pip slippage simulation. Must remain profitable.
+3. Seasonal test: break results by year. At least 8 of 11 years must 
+   be profitable individually.
+4. Parameter sensitivity test: shift each optimized parameter ±1 step.
+   Results must not collapse. Gradual degradation = robust. 
+   Cliff-edge = overfit.
+
+══════════════════════════════════════════════
+ALL-WEATHER CONDITIONS HANDLING
+══════════════════════════════════════════════
+
+The EA must handle all of these correctly without blowing the account:
+
+TRENDING MARKET:
+  The retest confirmation naturally catches continuation moves in 
+  trending conditions. RR multiplier of 1.8 should capture large 
+  trend day moves. No special handling needed.
+
+RANGING MARKET:
+  The MinRangePips and MaxRangePips filters prevent trading on 
+  abnormally tight or wide days. The MaxTPPips cap prevents 
+  setting unrealistic targets in a ranging environment.
+
+HIGH VOLATILITY / NEWS DAYS:
+  MaxRangePips filter will exclude most news-spike days where the 
+  Asian range was already blown out.
+  Spread filter prevents entry if spread has spiked (as it does 
+  during news).
+  As an optional enhancement: add a NewsFilter boolean input 
+  (default false) — when true, fetch the economic calendar events 
+  for the day (use iCustom or manual time inputs) and skip trading 
+  if a GBP or USD red-folder news event falls within 60 minutes of 
+  the planned entry window.
+
+LOW VOLATILITY MARKETS:
+  MinRangePips filter handles this. Dead market days are skipped.
+
+GAPS (Sunday opens):
+  In IsNewDay() check: if today is Monday and the gap between 
+  Friday close and current price > GapFilterPips (input, default 30),
+  skip the day.
+
+══════════════════════════════════════════════
+FINAL DELIVERABLES
+══════════════════════════════════════════════
+
+Produce in this exact sequence:
+
+1. RONIN.mq5 — complete compilable EA source code
+   - Must compile in MT5 with zero errors, zero warnings.
+   - Must pass MT5 MetaEditor's syntax check.
+
+2. RONIN_DefaultBacktest.txt — Strategy Tester report
+   - Full 11-year backtest with default settings.
+   - All metrics listed above recorded.
+
+3. RONIN_OptimizationReport.txt — Optimization results
+   - Best parameter set per each optimization round.
+   - Final selected parameter set with justification.
+
+4. RONIN_RobustnessChecks.txt
+   - Results of all 4 robustness checks.
+   - Pass/fail per check.
+
+5. RONIN_FinalParams.set
+   - MT5-compatible .set file with the final optimized parameters.
+
+6. RONIN_README.txt
+   - Setup instructions: symbol, timeframe, broker requirements.
+   - VPS recommendation.
+   - What each input parameter does.
+   - Known limitations.
+   - Conditions under which the EA should be paused manually 
+     (e.g., central bank week, extreme geopolitical events).
+
+══════════════════════════════════════════════
+QUALITY CHECKLIST — VERIFY EVERY ITEM BEFORE DELIVERY
+══════════════════════════════════════════════
+
+[ ] No martingale. No grid. No averaging down. Ever.
+[ ] Every trade has a hard SL set at order submission.
+[ ] Position size is risk-percent based, never fixed lot.
+[ ] Daily loss limit enforced.
+[ ] Max drawdown circuit breaker enforced.
+[ ] One trade per day maximum.
+[ ] Spread filter on entry.
+[ ] No overnight holds (17:00 GMT time exit).
+[ ] No magic numbers in code body — all as named constants or inputs.
+[ ] Every OrderSend return value checked.
+[ ] Every function has a single clear responsibility.
+[ ] Code compiles clean — zero warnings in MetaEditor.
+[ ] 11+ years backtest completed on real tick data.
+[ ] Walk-forward validation passed (2013-2019 in-sample, 
+    2020-2024 out-of-sample).
+[ ] Minimum 4 robustness checks passed.
+[ ] Final .set file produced.
+[ ] README complete.
+
+══════════════════════════════════════════════
+BEGIN EXECUTION
+══════════════════════════════════════════════
+
+Start with RONIN.mq5. 
+Write the full source code first, section by section, 
+without skipping any function. 
+Do not summarize or placeholder any function with a comment 
+like "// implement later". Every function must be complete and 
+working in the first pass.
+After the full code is written, proceed to the backtesting 
+protocol, optimization, and then the remaining deliverables.
